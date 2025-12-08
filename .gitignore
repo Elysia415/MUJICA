@@ -1,0 +1,27 @@
+# User specific
+.history/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environments
+.env
+
+# Data
+data/raw/
+data/processed/
+data/lancedb/
+
+# IDE settings
+.vscode/
+.idea/
