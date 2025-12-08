@@ -1,0 +1,9 @@
+openreview-py
+requests
+lancedb
+pandas
+openai
+streamlit
+python-dotenv
+tiktoken
+PyPDF2
