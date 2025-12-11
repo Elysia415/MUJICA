@@ -1,4 +1,16 @@
-# MUJICA - NeurIPS 2024 深度洞察与报告生成智能体
+---
+title: MUJICA NeurIPS 2024 Agent
+emoji: 🌌
+colorFrom: blue
+colorTo: purple
+sdk: streamlit
+sdk_version: 1.39.0
+app_file: app.py
+pinned: false
+license: mit
+---
+
+# MUJICA - 深度洞察与报告生成智能体
 
 **(Multi-stage User-Judged Integration & Corroboration Architecture)**
 

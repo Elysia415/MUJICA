@@ -1,38 +1,54 @@
 from openai import OpenAI
 import os
-import json
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 
-def get_llm_client():
+def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None):
     """
     Returns an initialized OpenAI client.
+    Args:
+        api_key: User-provided API key. If None, falls back to env var.
+        base_url: User-provided Base URL. If None, falls back to env var.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("Warning: OPENAI_API_KEY not found in environment variables.")
+    # 1. Determine API Key
+    final_api_key = api_key if api_key else os.getenv("OPENAI_API_KEY")
+    
+    if not final_api_key:
+        print("Warning: API Key not found (neither provided nor in env).")
         return None
-    return OpenAI(api_key=api_key)
+    
+    # 2. Determine Base URL
+    final_base_url = base_url if base_url else os.getenv("OPENAI_BASE_URL")
+    
+    return OpenAI(api_key=final_api_key, base_url=final_base_url)
+
+def get_embedding(text: str, model="text-embedding-3-small", 
+                 api_key: Optional[str] = None, 
+                 base_url: Optional[str] = None) -> list:
+    """
+    Generates vector embedding for the given text.
+    """
+    client = get_llm_client(api_key=api_key, base_url=base_url)
+    if not client:
+        return []
+    try:
+        text = text.replace("\n", " ")
+        return client.embeddings.create(input=[text], model=model).data[0].embedding
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return []
 
 def chat(messages: List[Dict[str, str]], 
-         model: str = "gpt-4",
+         model: str = "gpt-4o",
          temperature: float = 0.2,
          client: Optional[OpenAI] = None) -> str:
     """
-    通用聊天完成函数
-    
-    Args:
-        messages: 消息列表，格式为 [{"role": "user", "content": "..."}, ...]
-        model: 模型名称
-        temperature: 温度参数
-        client: OpenAI 客户端实例，如果为 None 则自动创建
-    
-    Returns:
-        LLM 返回的文本内容
+    Generic chat wrapper.
     """
+    # Client should be passed in, but if not, logic inside get_llm_client handles env fallback
     if client is None:
         client = get_llm_client()
         if client is None:
-            raise ValueError("Failed to initialize OpenAI client")
+            return ""
     
     try:
         response = client.chat.completions.create(
