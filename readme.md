@@ -1,5 +1,5 @@
 ---
-title: MUJICA NeurIPS 2024 Agent
+title: MUJICA
 emoji: 🌌
 colorFrom: blue
 colorTo: purple
