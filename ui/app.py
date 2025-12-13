@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -99,103 +100,193 @@ def _render_research_agent(*, use_system_key: bool, user_api_key: str, user_base
     col_chat, col_context = st.columns([0.65, 0.35], gap="large")
 
     with col_chat:
-        user_query = st.chat_input("Ask a research question")
+        # 初始化/连接知识库（不依赖 LLM）
+        kb = KnowledgeBase()
+        kb.initialize_db()
 
+        # 展示历史对话（只放用户问题/简短状态，不把整篇报告塞进聊天气泡）
         for msg in st.session_state["messages"]:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
+        user_query = st.chat_input("Ask a research question")
+
+        # 新问题：生成 plan（待用户批准）
         if user_query:
             st.session_state["messages"].append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
 
-            active_api_key = None
-            active_base_url = None
+            # 清空上一次结果
+            st.session_state["research_notes"] = []
+            st.session_state["final_report"] = ""
+            st.session_state["verification_result"] = None
+            st.session_state["plan_approved"] = False
+            st.session_state["pending_plan"] = None
+            st.session_state["plan_editor_text"] = ""
 
-            if use_system_key:
-                active_api_key = os.getenv("OPENAI_API_KEY")
-                active_base_url = os.getenv("OPENAI_BASE_URL", None)
-            else:
-                active_api_key = user_api_key.strip() or None
-                active_base_url = user_base_url.strip() or None
-
+            # 解析认证信息 -> 初始化 LLM
+            active_api_key = os.getenv("OPENAI_API_KEY") if use_system_key else (user_api_key.strip() or None)
+            active_base_url = os.getenv("OPENAI_BASE_URL", None) if use_system_key else (user_base_url.strip() or None)
             llm = get_llm_client(api_key=active_api_key, base_url=active_base_url)
             if not llm:
                 st.error("Authentication Failed. Please provide a valid Access Code or your own API Key.")
             else:
-                kb = KnowledgeBase()
-                kb.initialize_db()
+                # DB stats（给 planner 用）
+                df = kb.search_structured()
+                stats = {"count": int(len(df))}
+                if hasattr(df, "empty") and not df.empty:
+                    try:
+                        stats["avg_rating"] = float(df["rating"].dropna().mean()) if "rating" in df.columns else None
+                    except Exception:
+                        stats["avg_rating"] = None
+                    try:
+                        if "decision" in df.columns:
+                            stats["decision_counts"] = (
+                                df["decision"].fillna("UNKNOWN").value_counts().head(10).to_dict()
+                            )
+                    except Exception:
+                        pass
 
                 planner = PlannerAgent(llm, model=model_name)
-                researcher = ResearcherAgent(kb, llm, model=model_name)
-                writer = WriterAgent(llm, model=model_name)
-                verifier = VerifierAgent(llm, model=model_name)
-
-                with st.status("Thinking...", expanded=True) as status:
+                with st.status("Planning...", expanded=True) as status:
                     st.write("Generating Research Plan...")
-                    plan = planner.generate_plan(user_query, {})
-                    st.json(plan, expanded=False)
+                    plan = planner.generate_plan(user_query, stats)
+                    st.session_state["pending_plan"] = plan
+                    st.session_state["plan_editor_text"] = json.dumps(plan, ensure_ascii=False, indent=2)
+                    status.update(label="Plan Generated (Waiting for Approval)", state="complete")
 
-                    st.write("Conducting Research...")
-                    notes = researcher.execute_research(plan)
-                    st.session_state["research_notes"] = notes
+        # 计划审核/编辑/批准
+        if st.session_state.get("pending_plan") and not st.session_state.get("plan_approved"):
+            st.subheader("Step 1 · Review & Approve Plan")
+            plan_text = st.text_area(
+                "Plan JSON (editable)",
+                key="plan_editor_text",
+                height=320,
+            )
 
-                    st.write("Writing Report...")
-                    report = writer.write_report(plan, notes)
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("Apply Edits"):
+                    try:
+                        st.session_state["pending_plan"] = json.loads(plan_text)
+                        st.success("Plan updated.")
+                    except Exception as e:
+                        st.error(f"Plan JSON parse error: {e}")
 
-                    st.write("Verifying...")
-                    chunk_map = {}
-                    for n in notes:
-                        for e in (n.get("evidence") or []):
-                            cid = e.get("chunk_id")
-                            txt = e.get("text")
-                            if cid and txt and cid not in chunk_map:
-                                chunk_map[cid] = txt
-
-                    verification = verifier.verify_report(report, {"chunks": chunk_map})
-
-                    status.update(label="Insight Generated", state="complete")
-
-                st.session_state["final_report"] = report
-                st.session_state["messages"].append({"role": "assistant", "content": report})
-                with st.chat_message("assistant"):
-                    st.markdown(report)
-                    if verification["is_valid"]:
-                        st.caption(f"✅ Verified (Score: {verification.get('score', 0)})")
+            with col_b:
+                if st.button("Approve & Run"):
+                    # 再次解析认证信息 -> 初始化 LLM
+                    active_api_key = os.getenv("OPENAI_API_KEY") if use_system_key else (user_api_key.strip() or None)
+                    active_base_url = os.getenv("OPENAI_BASE_URL", None) if use_system_key else (user_base_url.strip() or None)
+                    llm = get_llm_client(api_key=active_api_key, base_url=active_base_url)
+                    if not llm:
+                        st.error("Authentication Failed. Please provide a valid Access Code or your own API Key.")
                     else:
-                        st.caption(f"⚠️ Verification Issues: {verification.get('notes')}")
+                        try:
+                            plan = json.loads(plan_text)
+                        except Exception as e:
+                            st.error(f"Plan JSON parse error: {e}")
+                            plan = None
+
+                        if plan:
+                            st.session_state["plan_approved"] = True
+
+                            researcher = ResearcherAgent(kb, llm, model=model_name)
+                            writer = WriterAgent(llm, model=model_name)
+                            verifier = VerifierAgent(llm, model=model_name)
+
+                            with st.status("Running...", expanded=True) as status:
+                                st.write("Conducting Research...")
+                                notes = researcher.execute_research(plan)
+                                st.session_state["research_notes"] = notes
+
+                                st.write("Writing Report...")
+                                report = writer.write_report(plan, notes)
+                                st.session_state["final_report"] = report
+
+                                st.write("Verifying (Claim-level NLI)...")
+                                chunk_map = {}
+                                for n in notes:
+                                    for e in (n.get("evidence") or []):
+                                        cid = e.get("chunk_id")
+                                        txt = e.get("text")
+                                        if cid and txt and cid not in chunk_map:
+                                            chunk_map[cid] = txt
+
+                                verification = verifier.verify_report(report, {"chunks": chunk_map})
+                                st.session_state["verification_result"] = verification
+
+                                status.update(label="Completed", state="complete")
+
+                            # 给聊天区一个简短回执（不贴整篇报告）
+                            v = st.session_state.get("verification_result") or {}
+                            st.session_state["messages"].append(
+                                {
+                                    "role": "assistant",
+                                    "content": f"报告已生成。核查：valid={v.get('is_valid')}, score={v.get('score')}.（详见右侧溯源/核查面板）",
+                                }
+                            )
+
+        # 输出最终报告（左栏）
+        if st.session_state.get("final_report"):
+            st.divider()
+            st.subheader("Final Report")
+            st.markdown(st.session_state["final_report"])
+
+            v = st.session_state.get("verification_result")
+            if isinstance(v, dict) and v:
+                st.caption(f"Verification: valid={v.get('is_valid')} · score={v.get('score')} · {v.get('notes')}")
 
     with col_context:
-        st.subheader("📚 Knowledge Context")
+        st.subheader("🔎 Traceability")
 
-        if st.session_state["research_notes"]:
-            st.info("Sources referenced in this session:")
+        tab_evi, tab_ver = st.tabs(["Evidence", "Verification"])
 
-            all_sources = {}
-            for note in st.session_state["research_notes"]:
-                for pid in note.get("sources", []):
-                    all_sources[pid] = {
-                        "title": f"Paper {pid}",
-                        "abstract": "Abstract content unavailable in this view.",
-                    }
+        with tab_evi:
+            notes = st.session_state.get("research_notes") or []
+            if not notes:
+                st.markdown("*No evidence yet. Ingest data and run a query.*")
+            else:
+                for note in notes:
+                    section_name = note.get("section", "Section")
+                    with st.expander(f"📌 {section_name}", expanded=False):
+                        if note.get("filters"):
+                            st.caption(f"Filters: {json.dumps(note.get('filters'), ensure_ascii=False)}")
 
-            for pid, info in all_sources.items():
-                st.markdown(
-                    f"""
-                    <div class="source-card">
-                        <div class="source-title">📄 {info['title']}</div>
-                        <div class="source-abstract">{info['abstract'][:100]}...</div>
-                        <small style="color: grey">ID: {pid}</small>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                        # 展示 key points（带 citations）
+                        if note.get("key_points"):
+                            st.markdown("**Key Points**")
+                            st.json(note.get("key_points"), expanded=False)
 
-                if st.button(f"View PDF ({pid})", key=pid):
-                    st.toast(f"Opening PDF for {pid}")
-        else:
-            st.markdown("*Research active... sources will appear here.*")
+                        evidence = note.get("evidence") or []
+                        if not evidence:
+                            st.markdown("*No evidence snippets for this section.*")
+                        else:
+                            for e in evidence:
+                                pid = e.get("paper_id")
+                                title = e.get("title", "")
+                                cid = e.get("chunk_id")
+                                src = e.get("source")
+                                st.markdown(f"**{title}**  \n`paper_id={pid}` · `chunk_id={cid}` · `source={src}`")
+                                st.code((e.get("text") or "")[:1200])
+
+        with tab_ver:
+            v = st.session_state.get("verification_result")
+            if not isinstance(v, dict) or not v:
+                st.markdown("*No verification yet.*")
+            else:
+                st.caption(f"valid={v.get('is_valid')} · score={v.get('score')} · {v.get('notes')}")
+                evals = v.get("evaluations") or []
+                if evals:
+                    try:
+                        import pandas as pd
+
+                        st.dataframe(pd.DataFrame(evals), use_container_width=True)
+                    except Exception:
+                        st.json(evals, expanded=False)
+                else:
+                    st.json(v, expanded=False)
 
 
 def main() -> None:
@@ -217,6 +308,10 @@ def main() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("research_notes", [])
     st.session_state.setdefault("final_report", "")
+    st.session_state.setdefault("pending_plan", None)
+    st.session_state.setdefault("plan_editor_text", "")
+    st.session_state.setdefault("plan_approved", False)
+    st.session_state.setdefault("verification_result", None)
 
     with st.sidebar:
         st.title("🌌 MUJICA")
