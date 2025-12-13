@@ -2,6 +2,8 @@ from openai import OpenAI
 import os
 from typing import List, Dict, Optional
 
+from src.utils.env import load_env
+
 def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None):
     """
     Returns an initialized OpenAI client.
@@ -9,6 +11,7 @@ def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None
         api_key: User-provided API key. If None, falls back to env var.
         base_url: User-provided Base URL. If None, falls back to env var.
     """
+    load_env()
     # 1. Determine API Key
     final_api_key = api_key if api_key else os.getenv("OPENAI_API_KEY")
     
@@ -27,6 +30,7 @@ def get_embedding(text: str, model="text-embedding-3-small",
     """
     Generates vector embedding for the given text.
     """
+    load_env()
     client = get_llm_client(api_key=api_key, base_url=base_url)
     if not client:
         return []
