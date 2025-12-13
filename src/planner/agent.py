@@ -23,14 +23,26 @@ class PlannerAgent:
         2. A list of 3-5 standard academic Sections (Introduction, Methodologies, etc.).
         3. A refined Search Query for each section to find relevant papers.
         4. Estimated number of papers to review (keep it between 5-20).
+        5. (Optional) structured filters to narrow down the corpus (rating/decision/year).
+        6. (Optional) retrieval budget per section (top_k_papers, top_k_chunks).
         
         Output JSON format:
         {
             "title": "Report Title",
+            "global_filters": {
+                "min_rating": 6.0,
+                "decision_in": ["Accept"],
+                "year_in": [2024]
+            },
             "sections": [
                 {
                     "name": "Section Name",
-                    "search_query": "Key terms for this section"
+                    "search_query": "Key terms for this section",
+                    "filters": {
+                        "min_rating": 6.0
+                    },
+                    "top_k_papers": 20,
+                    "top_k_chunks": 40
                 }
             ],
             "estimated_papers": 10

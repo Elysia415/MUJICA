@@ -347,6 +347,62 @@ class KnowledgeBase:
             out[d["id"]] = d
         return out
 
+    def get_paper(self, paper_id: str) -> Optional[Dict[str, Any]]:
+        if not paper_id or self._meta_conn is None:
+            return None
+        row = self._meta_conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_reviews(self, paper_id: str) -> List[Dict[str, Any]]:
+        if not paper_id or self._meta_conn is None:
+            return []
+        rows = self._meta_conn.execute(
+            "SELECT * FROM reviews WHERE paper_id = ? ORDER BY idx ASC",
+            (paper_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_chunks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        返回 chunk 级别命中（包含 chunk_id / paper_id / text / 距离），并补充 paper 标题等元数据。
+        """
+        if self.db is None:
+            raise RuntimeError("KnowledgeBase not initialized. Call initialize_db() first.")
+        if self.chunks_table not in (self.db.table_names() if self.db else []):
+            return []
+
+        qv = get_embedding(query, model=self.embedding_model)
+        if not qv:
+            return []
+
+        tbl = self.db.open_table(self.chunks_table)
+        hits = tbl.search(qv).limit(limit).to_list()
+        if not hits:
+            return []
+
+        ids = list({h.get("paper_id") for h in hits if h.get("paper_id")})
+        meta = self._get_papers_by_ids(ids)
+
+        enriched: List[Dict[str, Any]] = []
+        for h in hits:
+            pid = h.get("paper_id")
+            m = meta.get(pid, {}) if pid else {}
+            enriched.append(
+                {
+                    "paper_id": pid,
+                    "title": m.get("title", ""),
+                    "abstract": m.get("abstract", ""),
+                    "rating": m.get("rating", None),
+                    "decision": m.get("decision", None),
+                    "chunk_id": h.get("chunk_id"),
+                    "source": h.get("source"),
+                    "chunk_index": h.get("chunk_index"),
+                    "text": h.get("text"),
+                    "_distance": h.get("_distance", None),
+                }
+            )
+        return enriched
+
     def search_semantic(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
         语义检索：默认优先在 chunk 表中搜索，然后聚合为 paper 结果返回（兼容旧接口）。
