@@ -16,6 +16,7 @@ from src.utils.llm import get_llm_client
 from src.data_engine.storage import KnowledgeBase
 from src.data_engine.loader import DataLoader
 from src.data_engine.fetcher import ConferenceDataFetcher
+from src.data_engine.ingestor import OpenReviewIngestor
 from src.planner.agent import PlannerAgent
 from src.researcher.agent import ResearcherAgent
 from src.writer.agent import WriterAgent
@@ -68,21 +69,28 @@ def _render_data_dashboard() -> None:
         st.subheader("Crawl OpenReview (Live)")
         venue_id = st.text_input("Venue ID", "NeurIPS.cc/2024/Conference")
         limit = st.slider("Max Papers", 10, 100, 20)
+        download_pdfs = st.checkbox("Download PDFs", value=True)
+        parse_pdfs = st.checkbox("Parse PDFs to Full Text", value=True, disabled=not download_pdfs)
+        max_pages = st.slider("Max PDF pages to parse", 1, 50, 12, disabled=not parse_pdfs)
 
         if st.button("Fetch & Ingest"):
-            fetcher = ConferenceDataFetcher()
-            with st.status("Crawling OpenReview...") as status:
-                st.write("Fetching metadata...")
-                papers = fetcher.fetch_papers(venue_id, limit=limit)
-                st.write(f"Found {len(papers)} papers.")
+            kb = KnowledgeBase()
+            kb.initialize_db()
+            ingestor = OpenReviewIngestor(kb, fetcher=ConferenceDataFetcher(output_dir="data/raw"))
 
-                st.write("Ingesting to Knowledge Base...")
-                kb = KnowledgeBase()
-                kb.initialize_db()
-                kb.ingest_data(papers)
-
+            with st.status("Crawling OpenReview...", expanded=True) as status:
+                st.write("Fetching / Downloading / Parsing / Indexing ...")
+                papers = ingestor.ingest_venue(
+                    venue_id=venue_id,
+                    limit=limit,
+                    download_pdfs=download_pdfs,
+                    parse_pdfs=parse_pdfs,
+                    max_pdf_pages=max_pages if parse_pdfs else None,
+                    max_downloads=limit if download_pdfs else None,
+                )
                 status.update(label="Crawl Complete!", state="complete")
-            st.success(f"Successfully added {len(papers)} new papers.")
+
+            st.success(f"Successfully ingested {len(papers)} papers.")
 
 
 def _render_research_agent(*, use_system_key: bool, user_api_key: str, user_base_url: str, model_name: str) -> None:

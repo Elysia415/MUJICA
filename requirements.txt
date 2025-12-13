@@ -7,3 +7,4 @@ streamlit
 python-dotenv
 tiktoken
 PyPDF2
+pdfplumber

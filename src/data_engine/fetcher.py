@@ -2,6 +2,7 @@ import openreview
 import os
 import requests
 import time
+import re
 from typing import List, Dict, Optional
 from pathlib import Path
 
@@ -82,7 +83,7 @@ class ConferenceDataFetcher:
                 if limit and idx >= limit:
                     break
                 
-                paper_data = self._extract_paper_info(submission, content_fields)
+                paper_data = self._extract_paper_info(submission, content_fields, venue_id=venue_id)
                 papers.append(paper_data)
                 
                 if (idx + 1) % 10 == 0:
@@ -97,7 +98,36 @@ class ConferenceDataFetcher:
         
         return papers
     
-    def _extract_paper_info(self, submission, content_fields: List[str]) -> Dict:
+    def _parse_numeric_score(self, value) -> Optional[float]:
+        """
+        OpenReview 的 rating/confidence 常见格式：
+        - "8: Accept"
+        - "3: High"
+        - 8 / 8.0
+        """
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            m = re.search(r"(-?\d+(?:\.\d+)?)", value)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    return None
+        return None
+
+    def _extract_year_from_venue(self, venue_id: str) -> Optional[int]:
+        m = re.search(r"\b(20\d{2})\b", venue_id or "")
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _extract_paper_info(self, submission, content_fields: List[str], venue_id: str) -> Dict:
         """
         从 OpenReview submission 对象中提取论文信息
         
@@ -111,7 +141,9 @@ class ConferenceDataFetcher:
         paper = {
             "id": submission.id,
             "forum": submission.forum,
-            "number": submission.number if hasattr(submission, 'number') else None
+            "number": submission.number if hasattr(submission, 'number') else None,
+            "venue_id": venue_id,
+            "year": self._extract_year_from_venue(venue_id),
         }
         
         # 提取内容字段
@@ -132,7 +164,11 @@ class ConferenceDataFetcher:
             paper['keywords'] = keywords if isinstance(keywords, list) else []
         
         if 'pdf' in content_fields:
-            paper['pdf_url'] = content.get('pdf', {}).get('value', '')
+            pdf_url = content.get('pdf', {}).get('value', '')
+            # OpenReview 有时返回相对路径，如 "/pdf?id=..."
+            if isinstance(pdf_url, str) and pdf_url.startswith("/"):
+                pdf_url = "https://openreview.net" + pdf_url
+            paper['pdf_url'] = pdf_url
         
         # 提取 TL;DR（如果有）
         paper['tldr'] = content.get('TL;DR', {}).get('value', '')
@@ -149,9 +185,13 @@ class ConferenceDataFetcher:
                 # 检查是否是评审
                 if 'Official_Review' in invitation:
                     review_content = reply.get('content', {})
+                    rating_raw = review_content.get('rating', {}).get('value', 'N/A')
+                    confidence_raw = review_content.get('confidence', {}).get('value', 'N/A')
                     review_data = {
-                        'rating': review_content.get('rating', {}).get('value', 'N/A'),
-                        'confidence': review_content.get('confidence', {}).get('value', 'N/A'),
+                        'rating_raw': rating_raw,
+                        'rating': self._parse_numeric_score(rating_raw),
+                        'confidence_raw': confidence_raw,
+                        'confidence': self._parse_numeric_score(confidence_raw),
                         'summary': review_content.get('summary', {}).get('value', ''),
                         'strengths': review_content.get('strengths', {}).get('value', ''),
                         'weaknesses': review_content.get('weaknesses', {}).get('value', '')
@@ -162,6 +202,10 @@ class ConferenceDataFetcher:
                 elif 'Decision' in invitation:
                     decision_content = reply.get('content', {})
                     paper['decision'] = decision_content.get('decision', {}).get('value', 'Unknown')
+
+        # 计算论文级别评分（兼容旧字段名 rating）
+        numeric_ratings = [r.get("rating") for r in paper["reviews"] if isinstance(r.get("rating"), (int, float))]
+        paper["rating"] = float(sum(numeric_ratings) / len(numeric_ratings)) if numeric_ratings else None
         
         return paper
     
@@ -192,11 +236,11 @@ class ConferenceDataFetcher:
                 note_title = note.content.get('title', {}).get('value', '').lower()
                 if title_lower in note_title or note_title in title_lower:
                     print(f"  ✓ Found matching paper")
-                    return self._extract_paper_info(note, ['title', 'abstract', 'authors', 'pdf'])
+                    return self._extract_paper_info(note, ['title', 'abstract', 'authors', 'pdf'], venue_id="Unknown")
             
             # 如果没有完全匹配，返回第一个结果
             print(f"  Using best match (partial)")
-            return self._extract_paper_info(notes[0], ['title', 'abstract', 'authors', 'pdf'])
+            return self._extract_paper_info(notes[0], ['title', 'abstract', 'authors', 'pdf'], venue_id="Unknown")
             
         except Exception as e:
             print(f"Error searching for paper: {e}")
@@ -233,6 +277,7 @@ class ConferenceDataFetcher:
             # 如果文件已存在，跳过
             if os.path.exists(filepath):
                 print(f"  [{idx+1}/{len(papers)}] Already exists: {filename}")
+                paper["pdf_path"] = filepath
                 continue
             
             try:
@@ -243,6 +288,8 @@ class ConferenceDataFetcher:
                 # 保存文件
                 with open(filepath, 'wb') as f:
                     f.write(response.content)
+
+                paper["pdf_path"] = filepath
                 
                 downloaded += 1
                 print(f"  [{idx+1}/{len(papers)}] ✓ Downloaded: {filename}")

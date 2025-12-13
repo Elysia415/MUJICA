@@ -41,6 +41,37 @@ def get_embedding(text: str, model="text-embedding-3-small",
         print(f"Error generating embedding: {e}")
         return []
 
+
+def get_embeddings(
+    texts: List[str],
+    model: str = "text-embedding-3-small",
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> List[list]:
+    """
+    批量生成 embedding（比逐条请求更快/更省）。
+    失败时会返回与输入等长的空向量列表。
+    """
+    load_env()
+    if not texts:
+        return []
+
+    client = get_llm_client(api_key=api_key, base_url=base_url)
+    if not client:
+        return [[] for _ in texts]
+
+    try:
+        cleaned = [(t or "").replace("\n", " ") for t in texts]
+        resp = client.embeddings.create(input=cleaned, model=model)
+        # OpenAI 返回顺序与输入一致（每条包含 index）
+        out = [None] * len(cleaned)
+        for item in resp.data:
+            out[item.index] = item.embedding
+        return [v if v is not None else [] for v in out]
+    except Exception as e:
+        print(f"Error generating embeddings: {e}")
+        return [[] for _ in texts]
+
 def chat(messages: List[Dict[str, str]], 
          model: str = "gpt-4o",
          temperature: float = 0.2,
