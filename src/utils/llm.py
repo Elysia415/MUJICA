@@ -1,8 +1,40 @@
 from openai import OpenAI
 import os
+import hashlib
 from typing import List, Dict, Optional
 
 from src.utils.env import load_env
+
+
+def _env_truthy(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _fake_embedding(text: str, *, dim: int = 384) -> list:
+    """
+    离线/测试用的确定性 embedding（不依赖外部服务）。
+    - 仅用于无 API Key 或希望可复现的单元测试场景
+    - 维度可通过 MUJICA_FAKE_EMBEDDING_DIM 调整
+    """
+    text = (text or "").encode("utf-8")
+    dim = max(16, int(dim))
+
+    # 生成足够多的 bytes
+    need = dim * 4
+    buf = b""
+    counter = 0
+    while len(buf) < need:
+        buf += hashlib.sha256(text + str(counter).encode("utf-8")).digest()
+        counter += 1
+
+    vec = []
+    for i in range(dim):
+        b = buf[i * 4 : (i + 1) * 4]
+        u = int.from_bytes(b, "little", signed=False)
+        # 映射到 [0,1)
+        vec.append((u % 1_000_000) / 1_000_000.0)
+    return vec
 
 def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None):
     """
@@ -31,6 +63,10 @@ def get_embedding(text: str, model="text-embedding-3-small",
     Generates vector embedding for the given text.
     """
     load_env()
+    if _env_truthy("MUJICA_FAKE_EMBEDDINGS"):
+        dim = int(os.getenv("MUJICA_FAKE_EMBEDDING_DIM", "384"))
+        return _fake_embedding(text, dim=dim)
+
     client = get_llm_client(api_key=api_key, base_url=base_url)
     if not client:
         return []
@@ -55,6 +91,10 @@ def get_embeddings(
     load_env()
     if not texts:
         return []
+
+    if _env_truthy("MUJICA_FAKE_EMBEDDINGS"):
+        dim = int(os.getenv("MUJICA_FAKE_EMBEDDING_DIM", "384"))
+        return [_fake_embedding(t, dim=dim) for t in texts]
 
     client = get_llm_client(api_key=api_key, base_url=base_url)
     if not client:
