@@ -29,13 +29,25 @@ class PDFParser:
         try:
             # 优先用 pdfplumber（通常比 PyPDF2 提取效果更好）
             if pdfplumber:
-                with pdfplumber.open(file_path) as pdf:
-                    pages = pdf.pages[:max_pages] if max_pages else pdf.pages
-                    for page in pages:
-                        extracted = page.extract_text() or ""
-                        if extracted.strip():
-                            text += extracted.strip() + "\n"
-                return text.strip()
+                try:
+                    with pdfplumber.open(file_path) as pdf:
+                        pages = pdf.pages[:max_pages] if max_pages else pdf.pages
+                        for page in pages:
+                            extracted = page.extract_text() or ""
+                            if extracted.strip():
+                                text += extracted.strip() + "\n"
+
+                    text = text.strip()
+                    # If pdfplumber yields empty text, fall back to PyPDF2
+                    if text:
+                        return text
+                    print(f"Warning: pdfplumber extracted empty text for {file_path}. Falling back to PyPDF2.")
+                except Exception as e:
+                    # If pdfplumber errors, fall back to PyPDF2
+                    print(f"Warning: pdfplumber failed for {file_path}: {e}. Falling back to PyPDF2.")
+
+                # reset before PyPDF2
+                text = ""
 
             with open(file_path, 'rb') as f:
                 reader = PyPDF2.PdfReader(f)
