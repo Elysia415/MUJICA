@@ -145,7 +145,15 @@ def _render_research_agent(*, use_system_key: bool, user_api_key: str, user_base
                     report = writer.write_report(plan, notes)
 
                     st.write("Verifying...")
-                    verification = verifier.verify_report(report, {})
+                    chunk_map = {}
+                    for n in notes:
+                        for e in (n.get("evidence") or []):
+                            cid = e.get("chunk_id")
+                            txt = e.get("text")
+                            if cid and txt and cid not in chunk_map:
+                                chunk_map[cid] = txt
+
+                    verification = verifier.verify_report(report, {"chunks": chunk_map})
 
                     status.update(label="Insight Generated", state="complete")
 
