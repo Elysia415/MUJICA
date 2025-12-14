@@ -3,8 +3,11 @@ import os
 import requests
 import time
 import re
+import random
 from typing import List, Dict, Optional
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 class ConferenceDataFetcher:
     """
@@ -42,15 +45,21 @@ class ConferenceDataFetcher:
                     baseurl='https://api2.openreview.net'
                 )
     
-    def fetch_papers(self, venue_id: str = "NeurIPS.cc/2024/Conference", 
-                     limit: Optional[int] = None,
-                     content_fields: List[str] = None) -> List[Dict]:
+    def fetch_papers(
+        self,
+        venue_id: str = "NeurIPS.cc/2024/Conference",
+        limit: Optional[int] = None,
+        *,
+        accepted_only: bool = False,
+        content_fields: List[str] = None,
+    ) -> List[Dict]:
         """
         获取会议的论文列表
         
         Args:
             venue_id: 会议 ID（例如 "NeurIPS.cc/2024/Conference"）
             limit: 限制返回的论文数量，None 表示获取全部
+            accepted_only: 仅返回决策为 Accept 的论文（含 oral/spotlight/poster 等）
             content_fields: 需要获取的内容字段列表
         
         Returns:
@@ -67,30 +76,79 @@ class ConferenceDataFetcher:
         try:
             # 构建 invitation（投稿邀请）
             submission_invitation = f"{venue_id}/-/Submission"
-            
-            print(f"Searching for submissions with invitation: {submission_invitation}")
-            
-            # 获取所有投稿
-            submissions = self.client.get_all_notes(
-                invitation=submission_invitation,
-                details='replies'  # 包含评审等回复信息
-            )
-            
-            print(f"Found {len(submissions)} submissions")
-            
-            # 处理每篇论文
-            for idx, submission in enumerate(submissions):
-                if limit and idx >= limit:
+
+            print(f"Searching submissions with invitation: {submission_invitation}")
+
+            # 关键优化：
+            # - 旧实现使用 get_all_notes 会把该会议所有 submission（数千篇）一次性拉回来，即使 limit=100 也要等全量返回
+            # - 改为 get_notes(limit/offset) 分页拉取，只拿到用户需要的条数
+            page_size = int(os.getenv("MUJICA_OPENREVIEW_PAGE_SIZE", "200") or 200)
+            page_size = max(20, min(page_size, 1000))
+
+            offset = 0
+            total_target = int(limit) if isinstance(limit, int) and limit > 0 else None
+            fetched = 0  # 实际加入 papers 的数量（accepted_only 时为“accepted 数量”）
+            seen = 0  # 扫描过的 submission 数量
+
+            while True:
+                batch_limit = page_size
+                if total_target is not None and (not accepted_only):
+                    # 非 accepted_only：limit 直接约束“返回条数”，可以缩小请求
+                    remain = total_target - fetched
+                    if remain <= 0:
+                        break
+                    batch_limit = min(batch_limit, remain)
+
+                submissions = self.client.get_notes(
+                    invitation=submission_invitation,
+                    details="replies",
+                    limit=batch_limit,
+                    offset=offset,
+                )
+
+                if not submissions:
                     break
-                
-                paper_data = self._extract_paper_info(submission, content_fields, venue_id=venue_id)
-                papers.append(paper_data)
-                
-                if (idx + 1) % 10 == 0:
-                    print(f"  Processed {idx + 1}/{len(submissions)} papers")
-            
-            print(f"✓ Successfully fetched {len(papers)} papers")
-            
+
+                for submission in submissions:
+                    seen += 1
+                    paper_data = self._extract_paper_info(submission, content_fields, venue_id=venue_id)
+
+                    if accepted_only:
+                        decision = paper_data.get("decision")
+                        d = str(decision or "").lower()
+                        if "accept" not in d:
+                            continue
+
+                    papers.append(paper_data)
+                    fetched += 1
+
+                    if total_target is not None and fetched >= total_target:
+                        break
+
+                offset += len(submissions)
+
+                # 进度日志
+                if accepted_only:
+                    if (seen % 50 == 0) or (total_target is not None and fetched >= total_target):
+                        suffix = f"/{total_target}" if total_target is not None else ""
+                        print(f"  Scanned {seen} submissions · accepted {fetched}{suffix}")
+                else:
+                    if fetched % 10 == 0:
+                        suffix = f"/{total_target}" if total_target is not None else ""
+                        print(f"  Processed {fetched}{suffix} papers")
+
+                if total_target is not None and fetched >= total_target:
+                    break
+
+                if len(submissions) < batch_limit:
+                    # 读到末尾
+                    break
+
+            if accepted_only:
+                print(f"✓ Successfully fetched {len(papers)} accepted papers (scanned {seen} submissions)")
+            else:
+                print(f"✓ Successfully fetched {len(papers)} papers")
+
         except Exception as e:
             print(f"Error fetching papers: {e}")
             import traceback
@@ -173,35 +231,108 @@ class ConferenceDataFetcher:
         # 提取 TL;DR（如果有）
         paper['tldr'] = content.get('TL;DR', {}).get('value', '')
         
+        def _val(obj: Dict, key: str, default=None):
+            if not isinstance(obj, dict):
+                return default
+            v = obj.get(key, default)
+            if isinstance(v, dict) and "value" in v:
+                return v.get("value", default)
+            return v
+
+        def _parse_presentation(decision: Optional[str]) -> Optional[str]:
+            """
+            从 decision 字符串中提取展示类型（oral/spotlight/poster）。
+            不同会议/年份的 decision 文本格式可能不同，因此做宽松匹配。
+            """
+            if not decision:
+                return None
+            d = str(decision).lower()
+            # 常见形式：Accept (Oral) / Accept (Spotlight) / Accept (Poster)
+            if "oral" in d:
+                return "oral"
+            if "spotlight" in d:
+                return "spotlight"
+            if "poster" in d:
+                return "poster"
+            # 有的会写 talk / presentation
+            if "talk" in d:
+                return "oral"
+            # 接收但未标明展示类型
+            if "accept" in d:
+                return "unknown"
+            return None
+
         # 提取决策信息（如果有评审）
         paper['decision'] = None
+        paper['presentation'] = None
         paper['reviews'] = []
         
         if hasattr(submission, 'details') and submission.details:
             replies = submission.details.get('replies', [])
             for reply in replies:
-                invitation = reply.get('invitation', '')
+                # OpenReview v2: replies 通常是 dict，invitation 字段在 invitations(list) 中
+                invs = reply.get("invitations") or []
+                if isinstance(invs, str):
+                    invs = [invs]
+                if not isinstance(invs, list):
+                    invs = []
+
+                reply_content = reply.get('content', {}) or {}
+
+                is_official_review = any(("Official_Review" in str(s)) or ("Official Review" in str(s)) for s in invs)
+                is_decision = any("Decision" in str(s) for s in invs)
+                has_rating = any(k in reply_content for k in ["rating", "recommendation", "overall_rating", "score"])
+                has_decision = "decision" in reply_content
                 
                 # 检查是否是评审
-                if 'Official_Review' in invitation:
-                    review_content = reply.get('content', {})
-                    rating_raw = review_content.get('rating', {}).get('value', 'N/A')
-                    confidence_raw = review_content.get('confidence', {}).get('value', 'N/A')
+                if is_official_review or has_rating:
+                    review_content = reply_content
+                    rating_raw = None
+                    for k in ["rating", "recommendation", "overall_rating", "score"]:
+                        if k in review_content:
+                            rating_raw = _val(review_content, k, None)
+                            break
+                    confidence_raw = None
+                    for k in ["confidence", "overall_confidence"]:
+                        if k in review_content:
+                            confidence_raw = _val(review_content, k, None)
+                            break
                     review_data = {
-                        'rating_raw': rating_raw,
+                        'rating_raw': rating_raw if rating_raw is not None else 'N/A',
                         'rating': self._parse_numeric_score(rating_raw),
-                        'confidence_raw': confidence_raw,
+                        'confidence_raw': confidence_raw if confidence_raw is not None else 'N/A',
                         'confidence': self._parse_numeric_score(confidence_raw),
-                        'summary': review_content.get('summary', {}).get('value', ''),
-                        'strengths': review_content.get('strengths', {}).get('value', ''),
-                        'weaknesses': review_content.get('weaknesses', {}).get('value', '')
+                        'summary': _val(review_content, 'summary', '') or '',
+                        'strengths': _val(review_content, 'strengths', '') or '',
+                        'weaknesses': _val(review_content, 'weaknesses', '') or '',
                     }
                     paper['reviews'].append(review_data)
                 
                 # 检查是否是决策
-                elif 'Decision' in invitation:
-                    decision_content = reply.get('content', {})
-                    paper['decision'] = decision_content.get('decision', {}).get('value', 'Unknown')
+                elif is_decision or has_decision:
+                    decision_content = reply_content
+                    decision_value = _val(decision_content, 'decision', None)
+                    if decision_value is None:
+                        decision_value = _val(decision_content, 'recommendation', None)
+                    if decision_value is not None:
+                        paper['decision'] = decision_value
+                        paper['presentation'] = _parse_presentation(paper.get("decision"))
+
+        # 兜底：部分会议把“接收与展示类型”直接写在 submission.content['venue']（例如 "NeurIPS 2024 poster"）
+        if paper.get("decision") is None:
+            venue_value = content.get("venue", {}).get("value", "")
+            if isinstance(venue_value, str) and venue_value.strip():
+                vv = venue_value.strip()
+                vv_lower = vv.lower()
+                if "submitted to" not in vv_lower:
+                    # 非 submitted 形式，通常已经有最终 venue（可视作已接收/已发布）
+                    pres = _parse_presentation(vv)
+                    if pres in {"oral", "spotlight", "poster"}:
+                        paper["decision"] = f"Accept ({pres})"
+                        paper["presentation"] = pres
+                    elif "accept" in vv_lower:
+                        paper["decision"] = vv
+                        paper["presentation"] = _parse_presentation(vv)
 
         # 计算论文级别评分（兼容旧字段名 rating）
         numeric_ratings = [r.get("rating") for r in paper["reviews"] if isinstance(r.get("rating"), (int, float))]
@@ -246,7 +377,7 @@ class ConferenceDataFetcher:
             print(f"Error searching for paper: {e}")
             return None
     
-    def download_pdfs(self, papers: List[Dict], max_downloads: Optional[int] = None):
+    def download_pdfs(self, papers: List[Dict], max_downloads: Optional[int] = None, on_progress=None):
         """
         下载论文 PDF
         
@@ -255,53 +386,239 @@ class ConferenceDataFetcher:
             max_downloads: 最大下载数量限制
         """
         print(f"Downloading PDFs for {len(papers)} papers...")
-        
-        downloaded = 0
-        failed = 0
-        
-        for idx, paper in enumerate(papers):
-            if max_downloads and downloaded >= max_downloads:
-                print(f"Reached download limit ({max_downloads})")
-                break
-            
-            pdf_url = paper.get('pdf_url', '')
+
+        # 并发下载：显著加速（默认 6 线程），并将旧实现的 0.5s 固定 sleep 改为可配置
+        max_workers = int(os.getenv("MUJICA_PDF_DOWNLOAD_WORKERS", "6") or 6)
+        max_workers = max(1, min(max_workers, 16))
+        delay = float(os.getenv("MUJICA_PDF_DOWNLOAD_DELAY", "0.0") or 0.0)
+        delay = max(0.0, min(delay, 5.0))
+        timeout = float(os.getenv("MUJICA_PDF_DOWNLOAD_TIMEOUT", "60") or 60)
+        retries = int(os.getenv("MUJICA_PDF_DOWNLOAD_RETRIES", "2") or 2)
+        retries = max(0, min(retries, 5))
+
+        force_redownload = (os.getenv("MUJICA_PDF_FORCE_REDOWNLOAD", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        validate_existing = (os.getenv("MUJICA_PDF_VALIDATE_EXISTING", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        eof_check = (os.getenv("MUJICA_PDF_EOF_CHECK", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        try:
+            min_bytes = int(os.getenv("MUJICA_PDF_MIN_BYTES", "10240") or 10240)  # 10KB
+        except Exception:
+            min_bytes = 10240
+        min_bytes = max(0, min(min_bytes, 50_000_000))
+
+        # thread-local session（减少重复握手/提升吞吐）
+        _local = threading.local()
+
+        def _session():
+            s = getattr(_local, "session", None)
+            if s is None:
+                s = requests.Session()
+                _local.session = s
+            return s
+
+        def _is_valid_pdf(path: str) -> bool:
+            if not path or not os.path.exists(path):
+                return False
+            try:
+                sz = os.path.getsize(path)
+                if min_bytes > 0 and sz < min_bytes:
+                    return False
+                with open(path, "rb") as f:
+                    head = f.read(5)
+                    if not head.startswith(b"%PDF-"):
+                        return False
+                    if eof_check:
+                        # EOF 通常在尾部附近，读最后 2KB 检查
+                        try:
+                            tail_size = 2048
+                            if sz > tail_size:
+                                f.seek(-tail_size, os.SEEK_END)
+                            tail = f.read(tail_size)
+                        except Exception:
+                            tail = b""
+                        if b"%%EOF" not in tail:
+                            return False
+                return True
+            except Exception:
+                return False
+
+        def _download_one(idx: int, paper: Dict) -> Dict:
+            pdf_url = paper.get("pdf_url", "")
             if not pdf_url:
-                print(f"  [{idx+1}/{len(papers)}] Skipping (no PDF URL): {paper.get('title', 'Unknown')[:50]}")
-                continue
-            
-            # 生成文件名
-            paper_id = paper.get('id', f'paper_{idx}')
+                return {"idx": idx, "paper_id": paper.get("id"), "status": "skipped", "error": "no_pdf_url"}
+
+            paper_id = paper.get("id", f"paper_{idx}")
             filename = f"{paper_id}.pdf"
             filepath = os.path.join(self.pdf_dir, filename)
-            
-            # 如果文件已存在，跳过
-            if os.path.exists(filepath):
-                print(f"  [{idx+1}/{len(papers)}] Already exists: {filename}")
-                paper["pdf_path"] = filepath
-                continue
-            
-            try:
-                # 下载 PDF
-                response = requests.get(pdf_url, timeout=30)
-                response.raise_for_status()
-                
-                # 保存文件
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
 
-                paper["pdf_path"] = filepath
-                
-                downloaded += 1
-                print(f"  [{idx+1}/{len(papers)}] ✓ Downloaded: {filename}")
-                
-                # 避免请求过快
-                time.sleep(0.5)
-                
-            except Exception as e:
-                failed += 1
-                print(f"  [{idx+1}/{len(papers)}] ✗ Failed: {filename} - {e}")
-        
-        print(f"\n✓ Download complete: {downloaded} succeeded, {failed} failed")
+            if (not force_redownload) and os.path.exists(filepath):
+                if (not validate_existing) or _is_valid_pdf(filepath):
+                    paper["pdf_path"] = filepath
+                    return {"idx": idx, "paper_id": paper_id, "status": "exists", "filepath": filepath}
+                # 存在但疑似损坏：触发重下
+                return {"idx": idx, "paper_id": paper_id, "status": "need_redownload", "filepath": filepath}
+
+            last_err = None
+            for attempt in range(retries + 1):
+                try:
+                    if delay > 0:
+                        # 加一点 jitter，避免多线程同时打爆
+                        time.sleep(delay * (0.85 + random.random() * 0.30))
+                    resp = _session().get(
+                        pdf_url,
+                        timeout=timeout,
+                        stream=True,
+                        headers={
+                            "User-Agent": "MUJICA/1.0 (+https://openreview.net)",
+                            "Accept": "application/pdf,*/*;q=0.8",
+                        },
+                    )
+                    resp.raise_for_status()
+                    with open(filepath, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                    # 基本校验（避免写入 HTML/错误页）
+                    if validate_existing and (not _is_valid_pdf(filepath)):
+                        raise RuntimeError("downloaded_file_is_not_valid_pdf")
+                    paper["pdf_path"] = filepath
+                    return {"idx": idx, "paper_id": paper_id, "status": "downloaded", "filepath": filepath}
+                except Exception as e:
+                    last_err = e
+                    # 简单退避
+                    if attempt < retries:
+                        # 429/503 等更长退避；如果有 Retry-After，优先遵守
+                        wait = min(1.0 * (2**attempt), 8.0)
+                        try:
+                            resp = getattr(e, "response", None)
+                            if resp is not None and hasattr(resp, "status_code"):
+                                sc = int(getattr(resp, "status_code") or 0)
+                                if sc in {429, 503, 502, 504}:
+                                    ra = None
+                                    try:
+                                        ra = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                                    except Exception:
+                                        ra = None
+                                    if ra is not None:
+                                        try:
+                                            wait = max(wait, float(ra))
+                                        except Exception:
+                                            pass
+                                    wait = max(wait, 2.0)
+                                if sc == 404:
+                                    # 404 基本不可能成功，直接退出重试
+                                    break
+                        except Exception:
+                            pass
+                        time.sleep(min(wait, 60.0))
+            return {"idx": idx, "paper_id": paper_id, "status": "failed", "error": str(last_err)}
+
+        # 预扫描：把“已存在且有效”的直接标记为 exists，不占用下载任务
+        pre_results: List[Dict] = []
+        download_targets: List[tuple[int, Dict]] = []
+        exists = 0
+        skipped = 0
+        need_redownload = 0
+
+        for idx, p in enumerate(papers):
+            pdf_url = p.get("pdf_url", "")
+            if not pdf_url:
+                skipped += 1
+                pre_results.append({"idx": idx, "paper_id": p.get("id"), "status": "skipped", "error": "no_pdf_url"})
+                continue
+
+            paper_id = p.get("id", f"paper_{idx}")
+            filepath = os.path.join(self.pdf_dir, f"{paper_id}.pdf")
+
+            if (not force_redownload) and os.path.exists(filepath):
+                if (not validate_existing) or _is_valid_pdf(filepath):
+                    p["pdf_path"] = filepath
+                    exists += 1
+                    pre_results.append({"idx": idx, "paper_id": paper_id, "status": "exists", "filepath": filepath})
+                    continue
+                # 存在但疑似损坏：加入下载队列
+                need_redownload += 1
+
+            download_targets.append((idx, p))
+
+        # max_downloads：限制“需要网络下载”的数量（不包含 exists）
+        if isinstance(max_downloads, int) and max_downloads > 0:
+            download_targets = download_targets[:max_downloads]
+
+        total = len(pre_results) + len(download_targets)
+        done = 0
+        downloaded = 0
+        failed = 0
+        redownloaded = 0
+
+        # 先把预扫描结果也计入进度（exists/skipped）
+        for r in pre_results:
+            done += 1
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "download_pdf",
+                            "current": done,
+                            "total": total,
+                            "paper_id": r.get("paper_id"),
+                            "status": r.get("status"),
+                        }
+                    )
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_download_one, idx, p) for idx, p in download_targets]
+            for fut in as_completed(futures):
+                r = fut.result()
+                done += 1
+                status = r.get("status")
+                if status == "downloaded":
+                    downloaded += 1
+                elif status == "need_redownload":
+                    redownloaded += 1
+                elif status == "failed":
+                    failed += 1
+
+                if callable(on_progress):
+                    try:
+                        on_progress(
+                            {
+                                "stage": "download_pdf",
+                                "current": done,
+                                "total": total,
+                                "paper_id": r.get("paper_id"),
+                                "status": status,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+        succeeded = exists + downloaded
+        print(
+            f"\n✓ Download complete: {succeeded} ok (downloaded={downloaded}, exists={exists}), "
+            f"{failed} failed, {skipped} skipped"
+            f" (workers={max_workers}, delay={delay}s, retries={retries}, timeout={timeout}s, "
+            f"force_redownload={force_redownload}, validate_existing={validate_existing}, min_bytes={min_bytes})"
+        )
     
     def get_venue_stats(self, venue_id: str = "NeurIPS.cc/2024/Conference") -> Dict:
         """
@@ -338,8 +655,14 @@ class ConferenceDataFetcher:
                 if hasattr(submission, 'details') and submission.details:
                     replies = submission.details.get('replies', [])
                     for reply in replies:
-                        if 'Decision' in reply.get('invitation', ''):
-                            decision = reply.get('content', {}).get('decision', {}).get('value', '').lower()
+                        invs = reply.get("invitations") or []
+                        if isinstance(invs, str):
+                            invs = [invs]
+                        if any("Decision" in str(s) for s in (invs or [])) or ("decision" in (reply.get("content") or {})):
+                            decision = (reply.get('content', {}) or {}).get('decision', {})
+                            if isinstance(decision, dict):
+                                decision = decision.get('value', '')
+                            decision = str(decision or '').lower()
                             if 'accept' in decision:
                                 stats["accepted"] += 1
                             elif 'reject' in decision:

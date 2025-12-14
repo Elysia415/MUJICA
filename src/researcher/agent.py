@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from src.data_engine.storage import KnowledgeBase
+from src.utils.json_utils import extract_json_object
+
+
+def _env_truthy(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
 
 
 class ResearcherAgent:
@@ -19,9 +27,43 @@ class ResearcherAgent:
             return df
 
         out = df.copy()
+
+        # ---------------------------
+        # 文本/元数据过滤（标题/作者/关键词/venue）
+        # ---------------------------
+        title_contains = (filters.get("title_contains") or "").strip()
+        if title_contains and "title" in out.columns:
+            out = out[out["title"].fillna("").astype(str).str.contains(title_contains, case=False, regex=False)]
+
+        venue_contains = (filters.get("venue_contains") or "").strip()
+        if venue_contains and "venue_id" in out.columns:
+            out = out[out["venue_id"].fillna("").astype(str).str.contains(venue_contains, case=False, regex=False)]
+
+        author_contains = (filters.get("author_contains") or "").strip()
+        if author_contains:
+            if "authors_text" in out.columns:
+                out = out[out["authors_text"].fillna("").astype(str).str.contains(author_contains, case=False, regex=False)]
+            elif "authors_json" in out.columns:
+                out = out[out["authors_json"].fillna("").astype(str).str.contains(author_contains, case=False, regex=False)]
+
+        keyword_contains = (filters.get("keyword_contains") or "").strip()
+        if keyword_contains:
+            if "keywords_text" in out.columns:
+                out = out[out["keywords_text"].fillna("").astype(str).str.contains(keyword_contains, case=False, regex=False)]
+            elif "keywords_json" in out.columns:
+                out = out[out["keywords_json"].fillna("").astype(str).str.contains(keyword_contains, case=False, regex=False)]
+
         min_rating = filters.get("min_rating", None)
         if isinstance(min_rating, (int, float)):
             out = out[out["rating"].notna() & (out["rating"] >= float(min_rating))]
+
+        min_year = filters.get("min_year", None)
+        if isinstance(min_year, int) and "year" in out.columns:
+            out = out[out["year"].notna() & (out["year"] >= int(min_year))]
+
+        max_year = filters.get("max_year", None)
+        if isinstance(max_year, int) and "year" in out.columns:
+            out = out[out["year"].notna() & (out["year"] <= int(max_year))]
 
         year_in = filters.get("year_in", None)
         if isinstance(year_in, list) and year_in:
@@ -32,13 +74,18 @@ class ResearcherAgent:
             # decision 可能为空
             out = out[out["decision"].fillna("").isin(decision_in)]
 
+        presentation_in = filters.get("presentation_in", None)
+        if isinstance(presentation_in, list) and presentation_in and "presentation" in out.columns:
+            out = out[out["presentation"].fillna("").isin(presentation_in)]
+
         return out
 
-    def execute_research(self, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def execute_research(self, plan: Dict[str, Any], *, on_progress: Optional[Any] = None) -> List[Dict[str, Any]]:
         """
         执行研究：结构化过滤 + 语义检索（chunk）+ 生成可追溯研究笔记（含证据片段）。
         """
-        print("Starting research phase...")
+        t_all = time.time()
+        print("[Research] starting research phase...")
         research_notes: List[Dict[str, Any]] = []
 
         metadata_df = self.kb.search_structured()
@@ -46,13 +93,39 @@ class ResearcherAgent:
         default_top_papers = int(plan.get("estimated_papers") or 10)
         default_top_papers = max(5, min(default_top_papers, 20))
 
-        for section in plan.get("sections", []):
+        sections = plan.get("sections", []) or []
+        if not isinstance(sections, list):
+            sections = []
+        total_sections = len(sections)
+        print(f"[Research] sections={total_sections} default_top_papers={default_top_papers}")
+
+        for si, section in enumerate(sections):
+            t_sec = time.time()
             section_name = section.get("name") or "Section"
             query = section.get("search_query") or ""
-            print(f"Researching section: {section_name} (Query: {query})")
+            print(f"[Research] ({si+1}/{total_sections}) section={section_name} query={query!r}")
+
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "research_section",
+                            "current": si + 1,
+                            "total": total_sections,
+                            "section": section_name,
+                            "query": query,
+                        }
+                    )
+                except Exception:
+                    pass
 
             section_filters = dict(global_filters)
             section_filters.update(section.get("filters") or {})
+            if section_filters:
+                try:
+                    print(f"[Research] filters={json.dumps(section_filters, ensure_ascii=False)}")
+                except Exception:
+                    print("[Research] filters=<unprintable>")
 
             top_k_papers = int(section.get("top_k_papers") or default_top_papers)
             top_k_papers = max(3, min(top_k_papers, 20))
@@ -62,16 +135,33 @@ class ResearcherAgent:
 
             # 1) structured filtering -> 候选 paper_id 集合
             allowed_paper_ids: Optional[set[str]] = None
+            allowed_papers_count: Optional[int] = None
             if isinstance(metadata_df, pd.DataFrame) and not metadata_df.empty and section_filters:
+                t_f = time.time()
                 filtered = self._apply_filters(metadata_df, section_filters)
                 allowed_paper_ids = set(filtered["id"].tolist())
+                allowed_papers_count = len(allowed_paper_ids)
+                print(
+                    f"[Research] structured_filter: papers {len(metadata_df)} -> {allowed_papers_count} (dt={time.time()-t_f:.2f}s)"
+                )
+            else:
+                if isinstance(metadata_df, pd.DataFrame):
+                    allowed_papers_count = int(len(metadata_df))
+                print("[Research] structured_filter: skipped (no filters or empty metadata)")
 
             # 2) chunk-level retrieval
+            t_r = time.time()
             chunk_hits = self.kb.search_chunks(query, limit=top_k_chunks)
+            dt_r = time.time() - t_r
+            raw_hits = len(chunk_hits)
             if allowed_paper_ids is not None:
                 chunk_hits = [h for h in chunk_hits if h.get("paper_id") in allowed_paper_ids]
+            after_hits = len(chunk_hits)
 
             if not chunk_hits:
+                print(
+                    f"[Research] retrieval: hits={raw_hits} filtered_hits={after_hits} dt={dt_r:.2f}s -> no evidence"
+                )
                 research_notes.append(
                     {
                         "section": section_name,
@@ -91,28 +181,60 @@ class ResearcherAgent:
                 if not pid:
                     continue
                 by_paper.setdefault(pid, []).append(h)
+            uniq_papers = len(by_paper)
 
             # 按最优距离排序 papers
             paper_ranked = sorted(
                 by_paper.items(),
                 key=lambda kv: min([x.get("_distance", 1e9) for x in kv[1]]),
             )[:top_k_papers]
+            print(
+                f"[Research] retrieval: hits={raw_hits} filtered_hits={after_hits} unique_papers={uniq_papers} "
+                f"select_papers={len(paper_ranked)} top_k_chunks={top_k_chunks} (dt={dt_r:.2f}s)"
+            )
 
             evidence: List[Dict[str, Any]] = []
             source_ids: List[str] = []
             chunks_per_paper = 2
             for pid, hits in paper_ranked:
                 source_ids.append(pid)
-                hits_sorted = sorted(hits, key=lambda x: x.get("_distance", 1e9))[:chunks_per_paper]
-                for hh in hits_sorted:
+                # 3.1) 强制补充 meta chunk（用于引用作者/关键词/评分/决策/年份等元信息）
+                meta_chunk_id = f"{pid}::meta::0"
+                paper_meta = self.kb.get_paper(pid) or {}
+                paper_title = paper_meta.get("title") or (hits[0].get("title") if hits else "") or ""
+
+                try:
+                    meta_chunk = self.kb.get_chunk_by_id(meta_chunk_id)
+                except Exception:
+                    meta_chunk = None
+
+                if isinstance(meta_chunk, dict) and (meta_chunk.get("text") or "").strip():
                     evidence.append(
                         {
                             "paper_id": pid,
-                            "title": hh.get("title", ""),
+                            "title": paper_title,
+                            "chunk_id": meta_chunk_id,
+                            "source": "meta",
+                            "chunk_index": int(meta_chunk.get("chunk_index") or 0),
+                            "text": (meta_chunk.get("text") or "")[:900],
+                            "rating": paper_meta.get("rating"),
+                            "decision": paper_meta.get("decision"),
+                            "_distance": None,
+                        }
+                    )
+
+                # 3.2) 再取内容相关 chunks（排除 meta，避免重复）
+                hits_sorted_all = sorted(hits, key=lambda x: x.get("_distance", 1e9))
+                content_hits = [h for h in hits_sorted_all if h.get("source") != "meta"][:chunks_per_paper]
+                for hh in content_hits:
+                    evidence.append(
+                        {
+                            "paper_id": pid,
+                            "title": hh.get("title", "") or paper_title,
                             "chunk_id": hh.get("chunk_id"),
                             "source": hh.get("source"),
                             "chunk_index": hh.get("chunk_index"),
-                            "text": (hh.get("text") or "")[:1500],
+                            "text": (hh.get("text") or "")[:1400],
                             "rating": hh.get("rating"),
                             "decision": hh.get("decision"),
                             "_distance": hh.get("_distance"),
@@ -121,6 +243,10 @@ class ResearcherAgent:
 
             # 4) LLM：基于证据生成“中间态笔记”
             #    - 让模型输出 JSON，便于后续 writer/verifier 使用
+            print(
+                f"[Research] evidence: papers={len(source_ids)} snippets={len(evidence)} "
+                f"(meta+content, chunks_per_paper={chunks_per_paper})"
+            )
             evidence_text = ""
             for e in evidence:
                 evidence_text += (
@@ -132,6 +258,7 @@ class ResearcherAgent:
             system_prompt = (
                 "你是 MUJICA 的 Researcher（中文输出）。"
                 "只能基于给定的 Evidence Snippets 写研究笔记；不允许编造。"
+                "请尽量利用证据中的元信息（例如 source=meta 里的作者/关键词/年份/评分/决策）进行综合分析。"
                 "如果证据不足，请明确说明未知/证据缺失。"
             )
             user_prompt = f"""
@@ -154,20 +281,58 @@ Evidence Snippets（可引用 chunk_id 以便溯源）：
             summary_content = ""
             key_points: List[Dict[str, Any]] = []
             try:
-                response = self.llm.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                parsed = json.loads(response.choices[0].message.content or "{}")
+                t_llm = time.time()
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+
+                # 优先 JSON mode；不支持时（如部分 GLM）退化为普通输出 + 提取 JSON
+                try:
+                    if _env_truthy("MUJICA_DISABLE_JSON_MODE"):
+                        raise RuntimeError("json_mode_disabled")
+                    response = self.llm.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        response_format={"type": "json_object"},
+                    )
+                    parsed = json.loads(response.choices[0].message.content or "{}")
+                except Exception as e:
+                    if str(e) != "json_mode_disabled":
+                        print(f"Researcher json_mode failed: {e} (fallback to plain JSON)")
+                    response = self.llm.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                    )
+                    parsed = extract_json_object(response.choices[0].message.content or "")
                 summary_content = parsed.get("summary", "") or ""
                 key_points = parsed.get("key_points", []) or []
+                print(
+                    f"[Research] summarise: dt={time.time()-t_llm:.2f}s summary_len={len(summary_content)} key_points={len(key_points)}"
+                )
             except Exception as e:
                 print(f"Error summarising: {e}")
                 summary_content = "研究笔记生成失败（LLM 调用/JSON 解析异常）。"
+
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "research_section_done",
+                            "current": si + 1,
+                            "total": total_sections,
+                            "section": section_name,
+                            "query": query,
+                            "allowed_papers": allowed_papers_count,
+                            "hits": raw_hits,
+                            "hits_after_filter": after_hits,
+                            "selected_papers": len(source_ids),
+                            "evidence": len(evidence),
+                            "elapsed": time.time() - t_sec,
+                        }
+                    )
+                except Exception:
+                    pass
 
             research_notes.append(
                 {
@@ -181,5 +346,7 @@ Evidence Snippets（可引用 chunk_id 以便溯源）：
                 }
             )
 
-        print(f"Completed research for {len(research_notes)} sections.")
+            print(f"[Research] section done: {section_name} dt={time.time()-t_sec:.2f}s")
+
+        print(f"[Research] completed: sections={len(research_notes)} elapsed={time.time()-t_all:.2f}s")
         return research_notes

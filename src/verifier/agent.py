@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+from src.utils.json_utils import extract_json_object
+
+
+def _env_truthy(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
 
 
 class VerifierAgent:
@@ -138,15 +146,28 @@ Evidence:
 }}
 """
             try:
-                resp = self.llm.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                parsed = json.loads(resp.choices[0].message.content or "{}")
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+
+                try:
+                    if _env_truthy("MUJICA_DISABLE_JSON_MODE"):
+                        raise RuntimeError("json_mode_disabled")
+                    resp = self.llm.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        response_format={"type": "json_object"},
+                    )
+                    parsed = json.loads(resp.choices[0].message.content or "{}")
+                except Exception as e:
+                    if str(e) != "json_mode_disabled":
+                        print(f"Verifier json_mode failed: {e} (fallback to plain JSON)")
+                    resp = self.llm.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                    )
+                    parsed = extract_json_object(resp.choices[0].message.content or "")
             except Exception as e:
                 parsed = {"label": "unknown", "score": 0.0, "reason": f"verification_error: {e}"}
 

@@ -1,6 +1,9 @@
 from openai import OpenAI
 import os
 import hashlib
+import re
+import time
+import random
 from typing import List, Dict, Optional
 
 from src.utils.env import load_env
@@ -9,6 +12,30 @@ from src.utils.env import load_env
 def _env_truthy(name: str) -> bool:
     v = (os.getenv(name) or "").strip().lower()
     return v in {"1", "true", "yes", "y", "on"}
+
+
+_EMBED_ERR_ONCE = set()
+_LAST_EMBED_REQ_AT = 0.0
+_LAST_EMBED_RL_LOG_AT = 0.0
+
+
+def _print_embedding_error_once(*, kind: str, model: str, err: Exception) -> None:
+    msg = str(err)
+    key = f"{kind}:{model}:{msg}"
+    if key in _EMBED_ERR_ONCE:
+        return
+    _EMBED_ERR_ONCE.add(key)
+
+    lower = msg.lower()
+    if "model does not exist" in lower or "code': 20012" in msg or "code\": 20012" in msg:
+        print(
+            f"{kind}: Embedding 模型不存在/不支持（model={model}）。"
+            "请检查 Embedding Model（通常不是聊天模型名），或开启 MUJICA_FAKE_EMBEDDINGS=1 走离线向量。"
+            f" 原始错误: {err}"
+        )
+        return
+
+    print(f"{kind}: {err}")
 
 
 def _fake_embedding(text: str, *, dim: int = 384) -> list:
@@ -36,6 +63,131 @@ def _fake_embedding(text: str, *, dim: int = 384) -> list:
         vec.append((u % 1_000_000) / 1_000_000.0)
     return vec
 
+
+def _is_rate_limited(err: Exception) -> bool:
+    """
+    兼容 OpenAI SDK / OpenAI-compatible 网关的 429 限流异常判断。
+    """
+    try:
+        sc = getattr(err, "status_code", None)
+        if sc is not None and int(sc) == 429:
+            return True
+    except Exception:
+        pass
+
+    msg = str(err or "")
+    lower = msg.lower()
+    if "error code: 429" in lower:
+        return True
+    if ("429" in lower) and ("rate limit" in lower or "rate limiting" in lower or "tpm" in lower):
+        return True
+    return False
+
+
+def _extract_retry_after_seconds(err: Exception) -> Optional[float]:
+    """
+    尝试从异常中提取服务端建议的重试等待时间（Retry-After）。
+    - OpenAI SDK 可能把 httpx.Response 放在 err.response
+    - 部分网关会把 “retry-after” 写在错误文本里
+    """
+    # 1) headers
+    for obj in [getattr(err, "response", None), getattr(err, "__cause__", None), getattr(err, "__context__", None)]:
+        try:
+            if obj is None:
+                continue
+            headers = getattr(obj, "headers", None)
+            if headers and isinstance(headers, dict):
+                ra = headers.get("retry-after") or headers.get("Retry-After")
+                if ra is not None:
+                    return float(ra)
+        except Exception:
+            continue
+
+    # 2) message
+    msg = str(err or "")
+    m = re.search(r"retry[- ]after\\s*([0-9]+(?:\\.[0-9]+)?)", msg, flags=re.I)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _throttle_embedding_requests() -> None:
+    """
+    通过最小请求间隔来“限速”，降低触发 TPM/RPM 的概率。
+    - MUJICA_EMBEDDING_MIN_INTERVAL: 每次 embedding 请求之间至少间隔多少秒（默认 0，不限速）
+    """
+    global _LAST_EMBED_REQ_AT
+    try:
+        min_interval = float(os.getenv("MUJICA_EMBEDDING_MIN_INTERVAL", "0") or 0.0)
+    except Exception:
+        min_interval = 0.0
+    if min_interval <= 0:
+        return
+
+    now = time.time()
+    wait = min_interval - (now - float(_LAST_EMBED_REQ_AT or 0.0))
+    if wait > 0:
+        time.sleep(min(wait, 60.0))
+    _LAST_EMBED_REQ_AT = time.time()
+
+
+def _embeddings_create_with_retry(client: OpenAI, *, model: str, input_texts: List[str], tag: Optional[str] = None):
+    """
+    对 embedding create 做 429 自动退避重试。
+    关键：不要在外层“吞掉异常后返回空向量”，否则会导致入库但没有向量，检索失效。
+    """
+    global _LAST_EMBED_RL_LOG_AT
+
+    try:
+        max_retries = int(os.getenv("MUJICA_EMBEDDING_RETRY_MAX", "8") or 8)
+    except Exception:
+        max_retries = 8
+    max_retries = max(0, min(max_retries, 30))
+
+    try:
+        base_delay = float(os.getenv("MUJICA_EMBEDDING_RETRY_BASE_DELAY", "1.0") or 1.0)
+    except Exception:
+        base_delay = 1.0
+    base_delay = max(0.2, min(base_delay, 30.0))
+
+    try:
+        max_delay = float(os.getenv("MUJICA_EMBEDDING_RETRY_MAX_DELAY", "60") or 60.0)
+    except Exception:
+        max_delay = 60.0
+    max_delay = max(1.0, min(max_delay, 600.0))
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            _throttle_embedding_requests()
+            return client.embeddings.create(input=input_texts, model=model)
+        except Exception as e:
+            last_err = e
+            if _is_rate_limited(e) and attempt < max_retries:
+                retry_after = _extract_retry_after_seconds(e)
+                wait = retry_after if (retry_after is not None and retry_after > 0) else min(base_delay * (2**attempt), max_delay)
+                # jitter
+                wait = min(max_delay, wait * (0.85 + random.random() * 0.30))
+
+                now = time.time()
+                if now - float(_LAST_EMBED_RL_LOG_AT or 0.0) >= 3.0:
+                    _LAST_EMBED_RL_LOG_AT = now
+                    prefix = f"[{tag}] " if tag else ""
+                    print(
+                        f"{prefix}Embedding 触发限流(429, TPM/RPM)。等待 {wait:.1f}s 后自动重试... "
+                        f"({attempt+1}/{max_retries})"
+                    )
+                time.sleep(wait)
+                continue
+
+            raise
+
+    # 理论上不会到这里
+    raise last_err if last_err else RuntimeError("Embedding create failed")
+
 def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None):
     """
     Returns an initialized OpenAI client.
@@ -58,7 +210,8 @@ def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None
 
 def get_embedding(text: str, model="text-embedding-3-small", 
                  api_key: Optional[str] = None, 
-                 base_url: Optional[str] = None) -> list:
+                 base_url: Optional[str] = None,
+                 tag: Optional[str] = None) -> list:
     """
     Generates vector embedding for the given text.
     """
@@ -72,9 +225,10 @@ def get_embedding(text: str, model="text-embedding-3-small",
         return []
     try:
         text = text.replace("\n", " ")
-        return client.embeddings.create(input=[text], model=model).data[0].embedding
+        resp = _embeddings_create_with_retry(client, model=str(model), input_texts=[text], tag=tag)
+        return resp.data[0].embedding
     except Exception as e:
-        print(f"Error generating embedding: {e}")
+        _print_embedding_error_once(kind="Error generating embedding", model=str(model), err=e)
         return []
 
 
@@ -83,6 +237,7 @@ def get_embeddings(
     model: str = "text-embedding-3-small",
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> List[list]:
     """
     批量生成 embedding（比逐条请求更快/更省）。
@@ -102,14 +257,43 @@ def get_embeddings(
 
     try:
         cleaned = [(t or "").replace("\n", " ") for t in texts]
-        resp = client.embeddings.create(input=cleaned, model=model)
+        resp = _embeddings_create_with_retry(client, model=str(model), input_texts=cleaned, tag=tag)
         # OpenAI 返回顺序与输入一致（每条包含 index）
         out = [None] * len(cleaned)
         for item in resp.data:
             out[item.index] = item.embedding
         return [v if v is not None else [] for v in out]
     except Exception as e:
-        print(f"Error generating embeddings: {e}")
+        # 兼容部分 OpenAI-compatible 网关：对单次请求的 input 数组长度有限制
+        # 例如：SiliconFlow 常见报错 "input batch size 100 > maximum allowed batch size 64"（code 20042）
+        msg = str(e)
+        m = re.search(r"maximum allowed batch size\s+(\d+)", msg)
+        if m:
+            try:
+                max_batch = int(m.group(1))
+            except Exception:
+                max_batch = 64
+
+            max_batch = max(1, min(max_batch, 256))
+            out_all: List[list] = []
+            for start in range(0, len(cleaned), max_batch):
+                batch = cleaned[start : start + max_batch]
+                try:
+                    sub_tag = f"{tag} split {start}-{start+len(batch)-1}" if tag else None
+                    r = _embeddings_create_with_retry(client, model=str(model), input_texts=batch, tag=sub_tag)
+                    batch_out = [None] * len(batch)
+                    for item in r.data:
+                        batch_out[item.index] = item.embedding
+                    out_all.extend([v if v is not None else [] for v in batch_out])
+                except Exception as ee:
+                    _print_embedding_error_once(kind="Error generating embeddings", model=str(model), err=ee)
+                    out_all.extend([[] for _ in batch])
+
+            # 保证返回长度一致
+            if len(out_all) == len(texts):
+                return out_all
+
+        _print_embedding_error_once(kind="Error generating embeddings", model=str(model), err=e)
         return [[] for _ in texts]
 
 def chat(messages: List[Dict[str, str]], 

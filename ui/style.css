@@ -1,79 +1,150 @@
-/* Global Theme */
+/* MUJICA UI (human-friendly, high-contrast, theme via CSS variables) */
+
+/* Layout paddings */
+[data-testid="stMainBlockContainer"] {
+    padding-top: 2.0rem;
+    padding-bottom: 5.0rem; /* 给底部 chat_input 留空间 */
+}
+
+/* App background */
 [data-testid="stAppViewContainer"] {
-    background-image: linear-gradient(#0f0c29, #302b63, #24243e);
-    color: #e0e0e0;
+    background: radial-gradient(900px 520px at 50% -10%, rgba(255, 92, 147, 0.16), transparent 62%),
+                radial-gradient(900px 540px at 15% 10%, rgba(255, 200, 221, 0.22), transparent 58%),
+                var(--bg);
+    color: var(--text);
 }
 
+/* Sidebar */
 [data-testid="stSidebar"] {
-    background-color: rgba(15, 12, 41, 0.9);
-    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border);
 }
 
-h1, h2, h3 {
-    color: #ffffff !important;
-    font-family: 'Inter', sans-serif;
+/* Typography */
+h1, h2, h3, h4, h5, h6 {
+    color: var(--text) !important;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", Arial, sans-serif;
 }
 
-/* Glassmorphism Cards */
-div.stMarkdown {
-    /* Base text color */
+/* Hero (landing) */
+.mujica-hero {
+    text-align: center;
+    margin: 1.0rem auto 0.25rem auto;
+}
+.mujica-hero-title {
+    font-size: 2.1rem;
+    line-height: 1.15;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+}
+.mujica-hero-subtitle {
+    margin-top: 0.5rem;
+    color: var(--muted);
+    font-size: 1.0rem;
 }
 
-/* Custom classes usually need markdown with HTML support or container hacks */
-.report-container {
-    background: rgba(255, 255, 255, 0.05);
-    backdrop-filter: blur(10px);
-    border-radius: 12px;
-    padding: 20px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    margin-bottom: 20px;
+/* Links */
+a {
+    color: var(--accent) !important;
 }
 
-.source-card {
-    background: rgba(0, 0, 0, 0.4);
-    border-left: 4px solid #00d2ff;
-    padding: 10px;
-    margin-bottom: 15px;
-    border-radius: 4px;
-}
-
-.source-title {
-    font-weight: bold;
-    color: #00d2ff;
-    font-size: 0.9em;
-}
-
-.source-abstract {
-    font-size: 0.8em;
-    color: #cccccc;
+/* Muted text */
+[data-testid="stCaptionContainer"], .stCaption, small {
+    color: var(--muted) !important;
 }
 
 /* Buttons */
 .stButton > button {
-    background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
-    color: white;
-    border: none;
-    border-radius: 20px;
-    font-weight: bold;
-    transition: transform 0.2s;
+    background: var(--accent);
+    color: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    font-weight: 600;
+    transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+    box-shadow: 0 10px 22px rgba(255, 92, 147, 0.16);
 }
-
 .stButton > button:hover {
-    transform: scale(1.05);
-    box-shadow: 0 0 15px rgba(0, 210, 255, 0.5);
+    background: var(--accent-hover);
+    transform: translateY(-1px);
+    box-shadow: 0 14px 26px rgba(255, 92, 147, 0.20);
 }
 
 /* Inputs */
-.stTextInput > div > div > input {
-    background-color: rgba(255, 255, 255, 0.1);
-    color: white;
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 8px;
+.stTextInput input,
+.stTextArea textarea,
+.stNumberInput input,
+.stSelectbox div[data-baseweb="select"] > div {
+    background-color: var(--input-bg) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important;
+}
+.stTextInput input::placeholder,
+.stTextArea textarea::placeholder {
+    color: var(--muted) !important;
 }
 
-/* Streamlit Expander */
+.stTextInput input:focus,
+.stTextArea textarea:focus,
+[data-testid="stChatInput"] textarea:focus {
+    outline: none !important;
+    border-color: rgba(255, 92, 147, 0.55) !important;
+    box-shadow: 0 0 0 4px rgba(255, 92, 147, 0.14) !important;
+}
+
+/* Chat bubbles */
+[data-testid="stChatMessage"] {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+}
+
+/* Card style (Streamlit 1.26 compatible)
+   - st.container(border=True) 在 1.26 不支持
+   - 我们用 st.form 作为“卡片容器”，这里把 stForm 样式化成卡片
+*/
+div[data-testid="stForm"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+    padding: 1.0rem 1.0rem 0.75rem 1.0rem;
+}
+
+/* Chat input */
+[data-testid="stChatInput"] textarea {
+    background: var(--input-bg) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important;
+}
+[data-testid="stChatInput"] textarea::placeholder {
+    color: var(--muted) !important;
+}
+
+/* Code blocks */
+[data-testid="stCodeBlock"] pre {
+    background: var(--code-bg) !important;
+    color: var(--text) !important;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+
+/* Alerts (errors/warnings/etc) readability */
+[data-testid="stAlert"] {
+    background: var(--panel) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important;
+    box-shadow: var(--shadow);
+}
+[data-testid="stAlert"] * {
+    color: var(--text) !important;
+}
+
+/* Expander header */
 .streamlit-expanderHeader {
-    background-color: rgba(255, 255, 255, 0.05);
-    border-radius: 8px;
+    background-color: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
 }

@@ -33,18 +33,60 @@ class OpenReviewIngestor:
         *,
         venue_id: str,
         limit: Optional[int] = None,
+        accepted_only: bool = False,
+        presentation_in: Optional[List[str]] = None,
         download_pdfs: bool = True,
         parse_pdfs: bool = True,
         max_pdf_pages: Optional[int] = 12,
         max_downloads: Optional[int] = None,
+        on_progress: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
-        papers = self.fetcher.fetch_papers(venue_id, limit=limit)
+        papers = self.fetcher.fetch_papers(venue_id, limit=limit, accepted_only=accepted_only)
+
+        # 双重兜底：某些会议 decision 字段可能缺失/格式不同，这里再做一次过滤保证语义
+        if accepted_only:
+            kept = []
+            for p in papers:
+                d = str((p or {}).get("decision") or "").lower()
+                if "accept" in d:
+                    kept.append(p)
+            papers = kept
+
+        # 进一步过滤展示类型（oral/spotlight/poster/unknown）
+        if accepted_only and isinstance(presentation_in, list) and presentation_in:
+            allowed = set([str(x).strip().lower() for x in presentation_in if str(x).strip()])
+            if allowed:
+                kept = []
+                for p in papers:
+                    pres = str((p or {}).get("presentation") or "").strip().lower()
+                    if pres in allowed:
+                        kept.append(p)
+                papers = kept
 
         if download_pdfs:
-            self.fetcher.download_pdfs(papers, max_downloads=max_downloads or limit)
+            self.fetcher.download_pdfs(papers, max_downloads=max_downloads or limit, on_progress=on_progress)
 
         if parse_pdfs:
-            for p in papers:
+            parse_targets = [p for p in papers if p.get("pdf_path") and os.path.exists(p.get("pdf_path"))]
+            total = len(parse_targets)
+            done = 0
+            for p in parse_targets:
+                done += 1
+                if callable(on_progress):
+                    try:
+                        on_progress(
+                            {
+                                "stage": "parse_pdf",
+                                "current": done,
+                                "total": total,
+                                "paper_id": p.get("id"),
+                                "title": p.get("title"),
+                                "pdf_path": p.get("pdf_path"),
+                            }
+                        )
+                    except Exception:
+                        pass
+
                 pdf_path = p.get("pdf_path")
                 if pdf_path and os.path.exists(pdf_path):
                     p["content"] = self.parser.parse_pdf(pdf_path, max_pages=max_pdf_pages)
