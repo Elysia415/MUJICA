@@ -196,6 +196,24 @@ class ResearcherAgent:
             evidence: List[Dict[str, Any]] = []
             source_ids: List[str] = []
             chunks_per_paper = 2
+            try:
+                review_chunks_per_paper = int(os.getenv("MUJICA_EVIDENCE_REVIEW_CHUNKS_PER_PAPER", "1") or 1)
+            except Exception:
+                review_chunks_per_paper = 1
+            review_chunks_per_paper = max(0, min(review_chunks_per_paper, 5))
+
+            # 决策/作者回应：按需补充（默认各 1 条，可用 env 设为 0 关闭）
+            try:
+                decision_chunks_per_paper = int(os.getenv("MUJICA_EVIDENCE_DECISION_CHUNKS_PER_PAPER", "1") or 1)
+            except Exception:
+                decision_chunks_per_paper = 1
+            decision_chunks_per_paper = max(0, min(decision_chunks_per_paper, 3))
+
+            try:
+                rebuttal_chunks_per_paper = int(os.getenv("MUJICA_EVIDENCE_REBUTTAL_CHUNKS_PER_PAPER", "1") or 1)
+            except Exception:
+                rebuttal_chunks_per_paper = 1
+            rebuttal_chunks_per_paper = max(0, min(rebuttal_chunks_per_paper, 3))
             for pid, hits in paper_ranked:
                 source_ids.append(pid)
                 # 3.1) 强制补充 meta chunk（用于引用作者/关键词/评分/决策/年份等元信息）
@@ -222,6 +240,82 @@ class ResearcherAgent:
                             "_distance": None,
                         }
                     )
+
+                # 3.1a) 决策说明 chunk（如果存在）
+                if decision_chunks_per_paper > 0:
+                    for didx in range(decision_chunks_per_paper):
+                        decision_chunk_id = f"{pid}::decision::{didx}"
+                        try:
+                            dc = self.kb.get_chunk_by_id(decision_chunk_id)
+                        except Exception:
+                            dc = None
+                        if isinstance(dc, dict) and (dc.get("text") or "").strip():
+                            evidence.append(
+                                {
+                                    "paper_id": pid,
+                                    "title": paper_title,
+                                    "chunk_id": decision_chunk_id,
+                                    "source": dc.get("source") or "decision",
+                                    "chunk_index": int(dc.get("chunk_index") or didx),
+                                    "text": (dc.get("text") or "")[:1200],
+                                    "rating": paper_meta.get("rating"),
+                                    "decision": paper_meta.get("decision"),
+                                    "_distance": None,
+                                }
+                            )
+                            break
+
+                # 3.1b) 作者 rebuttal/response chunk（如果存在）
+                if rebuttal_chunks_per_paper > 0:
+                    for ridx in range(rebuttal_chunks_per_paper):
+                        rebuttal_chunk_id = f"{pid}::rebuttal::{ridx}"
+                        try:
+                            rc = self.kb.get_chunk_by_id(rebuttal_chunk_id)
+                        except Exception:
+                            rc = None
+                        if isinstance(rc, dict) and (rc.get("text") or "").strip():
+                            evidence.append(
+                                {
+                                    "paper_id": pid,
+                                    "title": paper_title,
+                                    "chunk_id": rebuttal_chunk_id,
+                                    "source": rc.get("source") or "rebuttal",
+                                    "chunk_index": int(rc.get("chunk_index") or ridx),
+                                    "text": (rc.get("text") or "")[:1200],
+                                    "rating": paper_meta.get("rating"),
+                                    "decision": paper_meta.get("decision"),
+                                    "_distance": None,
+                                }
+                            )
+                            break
+
+                # 3.1b) 额外补充 review chunks（让“评审关注点/意见”分析更有证据；可用 env 关闭）
+                if review_chunks_per_paper > 0:
+                    try:
+                        reviews_rows = self.kb.get_reviews(pid)
+                    except Exception:
+                        reviews_rows = []
+                    if isinstance(reviews_rows, list) and reviews_rows:
+                        for ridx in range(min(len(reviews_rows), review_chunks_per_paper)):
+                            review_chunk_id = f"{pid}::review_{ridx}::0"
+                            try:
+                                rc = self.kb.get_chunk_by_id(review_chunk_id)
+                            except Exception:
+                                rc = None
+                            if isinstance(rc, dict) and (rc.get("text") or "").strip():
+                                evidence.append(
+                                    {
+                                        "paper_id": pid,
+                                        "title": paper_title,
+                                        "chunk_id": review_chunk_id,
+                                        "source": rc.get("source") or f"review_{ridx}",
+                                        "chunk_index": int(rc.get("chunk_index") or 0),
+                                        "text": (rc.get("text") or "")[:1200],
+                                        "rating": paper_meta.get("rating"),
+                                        "decision": paper_meta.get("decision"),
+                                        "_distance": None,
+                                    }
+                                )
 
                 # 3.2) 再取内容相关 chunks（排除 meta，避免重复）
                 hits_sorted_all = sorted(hits, key=lambda x: x.get("_distance", 1e9))

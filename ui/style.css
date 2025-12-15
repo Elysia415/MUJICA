@@ -8,8 +8,8 @@
 
 /* App background */
 [data-testid="stAppViewContainer"] {
-    background: radial-gradient(900px 520px at 50% -10%, rgba(255, 92, 147, 0.16), transparent 62%),
-                radial-gradient(900px 540px at 15% 10%, rgba(255, 200, 221, 0.22), transparent 58%),
+    background: radial-gradient(980px 560px at 50% -10%, var(--bg-glow-1), transparent 62%),
+                radial-gradient(980px 580px at 15% 10%, var(--bg-glow-2), transparent 58%),
                 var(--bg);
     color: var(--text);
 }
@@ -24,6 +24,24 @@
 h1, h2, h3, h4, h5, h6 {
     color: var(--text) !important;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", Arial, sans-serif;
+}
+
+/* 关键：Streamlit 的 widget label/正文有时会被内联样式覆盖，导致暗色看不清。
+   这里统一强制提高可读性。 */
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] *,
+[data-testid="stWidgetLabel"] *,
+label,
+p,
+span,
+div,
+li {
+    color: var(--text);
+}
+
+[data-testid="stWidgetLabel"] {
+    color: var(--text) !important;
+    font-weight: 600;
 }
 
 /* Hero (landing) */
@@ -55,18 +73,18 @@ a {
 
 /* Buttons */
 .stButton > button {
-    background: var(--accent);
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
     color: #ffffff;
     border: 1px solid var(--border);
     border-radius: 14px;
     font-weight: 600;
     transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
-    box-shadow: 0 10px 22px rgba(255, 92, 147, 0.16);
+    box-shadow: 0 12px 26px var(--accent-shadow);
 }
 .stButton > button:hover {
-    background: var(--accent-hover);
+    background: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent-2-hover) 100%);
     transform: translateY(-1px);
-    box-shadow: 0 14px 26px rgba(255, 92, 147, 0.20);
+    box-shadow: 0 16px 30px var(--accent-shadow-hover);
 }
 
 /* Inputs */
@@ -88,8 +106,8 @@ a {
 .stTextArea textarea:focus,
 [data-testid="stChatInput"] textarea:focus {
     outline: none !important;
-    border-color: rgba(255, 92, 147, 0.55) !important;
-    box-shadow: 0 0 0 4px rgba(255, 92, 147, 0.14) !important;
+    border-color: var(--accent-focus) !important;
+    box-shadow: 0 0 0 4px var(--accent-focus-shadow) !important;
 }
 
 /* Chat bubbles */
@@ -110,6 +128,7 @@ div[data-testid="stForm"] {
     border-radius: 18px;
     box-shadow: var(--shadow);
     padding: 1.0rem 1.0rem 0.75rem 1.0rem;
+    backdrop-filter: blur(10px);
 }
 
 /* Chat input */
@@ -147,4 +166,12 @@ div[data-testid="stForm"] {
     background-color: var(--panel-2);
     border: 1px solid var(--border);
     border-radius: 12px;
+}
+
+/* Dataframe / table readability (dark theme) */
+[data-testid="stDataFrame"] {
+    background: var(--panel) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important;
+    box-shadow: var(--shadow);
 }

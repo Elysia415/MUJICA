@@ -4,7 +4,7 @@ import requests
 import time
 import re
 import random
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -51,6 +51,8 @@ class ConferenceDataFetcher:
         limit: Optional[int] = None,
         *,
         accepted_only: bool = False,
+        skip_paper_ids: Optional[Set[str]] = None,
+        on_progress=None,
         content_fields: List[str] = None,
     ) -> List[Dict]:
         """
@@ -60,6 +62,7 @@ class ConferenceDataFetcher:
             venue_id: 会议 ID（例如 "NeurIPS.cc/2024/Conference"）
             limit: 限制返回的论文数量，None 表示获取全部
             accepted_only: 仅返回决策为 Accept 的论文（含 oral/spotlight/poster 等）
+            skip_paper_ids: 跳过已存在的 paper_id（用于“追加抓取”模式）。当传入该参数时，limit 表示“返回的新论文数量上限”。
             content_fields: 需要获取的内容字段列表
         
         Returns:
@@ -92,8 +95,8 @@ class ConferenceDataFetcher:
 
             while True:
                 batch_limit = page_size
-                if total_target is not None and (not accepted_only):
-                    # 非 accepted_only：limit 直接约束“返回条数”，可以缩小请求
+                # 当启用 accepted_only 或 skip_paper_ids 时，需要“扫描更多 submission 才能凑够目标数量”，不做缩小优化
+                if (total_target is not None) and (not accepted_only) and (not skip_paper_ids):
                     remain = total_target - fetched
                     if remain <= 0:
                         break
@@ -119,6 +122,11 @@ class ConferenceDataFetcher:
                         if "accept" not in d:
                             continue
 
+                    if skip_paper_ids:
+                        pid = str(paper_data.get("id") or "").strip()
+                        if pid and pid in skip_paper_ids:
+                            continue
+
                     papers.append(paper_data)
                     fetched += 1
 
@@ -126,6 +134,23 @@ class ConferenceDataFetcher:
                         break
 
                 offset += len(submissions)
+
+                # UI 进度回调（按“已满足目标数量”汇报；accepted_only/skip_existing 时扫描更多 submission）
+                if callable(on_progress) and total_target is not None and total_target > 0:
+                    try:
+                        on_progress(
+                            {
+                                "stage": "fetch_papers",
+                                "current": min(fetched, total_target),
+                                "total": total_target,
+                                "scanned": seen,
+                                "accepted_only": bool(accepted_only),
+                                "skip_existing": bool(skip_paper_ids),
+                                "venue_id": venue_id,
+                            }
+                        )
+                    except Exception:
+                        pass
 
                 # 进度日志
                 if accepted_only:
@@ -264,11 +289,17 @@ class ConferenceDataFetcher:
 
         # 提取决策信息（如果有评审）
         paper['decision'] = None
+        paper['decision_text'] = None  # 决策 note 的正文（如 comment/理由等）
         paper['presentation'] = None
         paper['reviews'] = []
+        paper['rebuttal_text'] = None  # 作者 rebuttal/response 的正文（可能有多条，合并保存）
         
         if hasattr(submission, 'details') and submission.details:
             replies = submission.details.get('replies', [])
+            # 记录“最新的决策 note”（按时间选择）
+            best_decision_cdate = -1
+            best_decision_text_cdate = -1
+            rebuttal_blocks: List[str] = []
             for reply in replies:
                 # OpenReview v2: replies 通常是 dict，invitation 字段在 invitations(list) 中
                 invs = reply.get("invitations") or []
@@ -279,14 +310,48 @@ class ConferenceDataFetcher:
 
                 reply_content = reply.get('content', {}) or {}
 
-                is_official_review = any(("Official_Review" in str(s)) or ("Official Review" in str(s)) for s in invs)
-                is_decision = any("Decision" in str(s) for s in invs)
+                invs_l = [str(s).lower() for s in invs]
+                is_official_review = any(("official_review" in s) or ("official review" in s) for s in invs_l)
+                # decision invitation 常见包含 "Decision"；也可能只有 content 里带 decision 字段
+                is_decision = any("decision" in s for s in invs_l)
+                # meta review invitation：常见为 Meta_Review / Meta Review / metareview
+                is_meta_review = any(
+                    ("meta_review" in s) or ("metareview" in s) or ("meta review" in s) for s in invs_l
+                )
+                # rebuttal / author response invitation
+                is_rebuttal = any(
+                    ("rebuttal" in s)
+                    or ("author_rebuttal" in s)
+                    or ("author rebuttal" in s)
+                    or ("author_response" in s)
+                    or ("author response" in s)
+                    or ("response" in s and "author" in s)
+                    for s in invs_l
+                )
                 has_rating = any(k in reply_content for k in ["rating", "recommendation", "overall_rating", "score"])
                 has_decision = "decision" in reply_content
                 
                 # 检查是否是评审
-                if is_official_review or has_rating:
+                # 注意：有些会议的作者回应会挂在 Official_Review 线程下（invitation 里包含 Official_Review + Rebuttal）
+                # 这里必须优先把 rebuttal/meta_review/decision 识别出来，避免把“作者回应”误塞进 reviews。
+                if (is_official_review or has_rating) and (not is_rebuttal) and (not is_decision) and (not has_decision) and (not is_meta_review):
                     review_content = reply_content
+
+                    # 某些 review note 可能包含作者 rebuttal 字段（把它抽出来，避免和 reviewer 文本混在一起）
+                    embedded_rebuttal = None
+                    for kk in ["rebuttal", "author_response", "author comment", "author_comment", "response"]:
+                        vv = _val(review_content, kk, None)
+                        if isinstance(vv, str) and vv.strip():
+                            embedded_rebuttal = vv.strip()
+                            break
+                    if embedded_rebuttal:
+                        try:
+                            cdate = int(reply.get("cdate") or reply.get("tcdate") or 0)
+                        except Exception:
+                            cdate = 0
+                        tag = f"Author response (from review note, cdate={cdate})" if cdate else "Author response (from review note)"
+                        rebuttal_blocks.append(f"{tag}:\n{embedded_rebuttal}".strip())
+
                     rating_raw = None
                     for k in ["rating", "recommendation", "overall_rating", "score"]:
                         if k in review_content:
@@ -297,26 +362,178 @@ class ConferenceDataFetcher:
                         if k in review_content:
                             confidence_raw = _val(review_content, k, None)
                             break
+
+                    # 尽量抽取“评审意见正文”（不同会议表单字段不同，做宽松兼容）
+                    summary = _val(review_content, "summary", "") or ""
+                    strengths = _val(review_content, "strengths", "") or ""
+                    weaknesses = _val(review_content, "weaknesses", "") or ""
+
+                    # 额外字段：把较长的文本字段也纳入（避免只有 checklist/短答）
+                    skip_keys = {
+                        # 打分/决策类
+                        "rating",
+                        "recommendation",
+                        "overall_rating",
+                        "score",
+                        "confidence",
+                        "overall_confidence",
+                        "decision",
+                        # 作者回应类（放到 paper-level rebuttal_text；不混进 reviewer 文本）
+                        "rebuttal",
+                        "author_response",
+                        "author comment",
+                        "author_comment",
+                        "response",
+                        # 常见短字段
+                        "title",
+                    }
+                    extra_pairs = []
+                    try:
+                        for k in (review_content or {}).keys():
+                            if k in skip_keys or k in {"summary", "strengths", "weaknesses"}:
+                                continue
+                            vv = _val(review_content, k, None)
+                            if not isinstance(vv, str):
+                                continue
+                            ss = vv.strip()
+                            if not ss:
+                                continue
+                            # 过滤掉过短的 Yes/No/checklist 类内容
+                            if len(ss) < 20:
+                                continue
+                            extra_pairs.append((str(k), ss))
+                    except Exception:
+                        extra_pairs = []
+
+                    # 只取前若干个，避免把整张表单都塞进单条 review（过长会影响吞吐/embedding 成本）
+                    extra_pairs = extra_pairs[:10]
+
+                    text_parts = []
+                    if rating_raw is not None:
+                        text_parts.append(f"Rating: {rating_raw}")
+                    if confidence_raw is not None:
+                        text_parts.append(f"Confidence: {confidence_raw}")
+                    if summary.strip():
+                        text_parts.append(f"Summary:\n{summary.strip()}")
+                    if strengths.strip():
+                        text_parts.append(f"Strengths:\n{strengths.strip()}")
+                    if weaknesses.strip():
+                        text_parts.append(f"Weaknesses:\n{weaknesses.strip()}")
+                    for k, ss in extra_pairs:
+                        text_parts.append(f"{k}:\n{ss}")
+                    review_text = "\n\n".join([x for x in text_parts if x]).strip()
+
                     review_data = {
                         'rating_raw': rating_raw if rating_raw is not None else 'N/A',
                         'rating': self._parse_numeric_score(rating_raw),
                         'confidence_raw': confidence_raw if confidence_raw is not None else 'N/A',
                         'confidence': self._parse_numeric_score(confidence_raw),
-                        'summary': _val(review_content, 'summary', '') or '',
-                        'strengths': _val(review_content, 'strengths', '') or '',
-                        'weaknesses': _val(review_content, 'weaknesses', '') or '',
+                        'summary': summary,
+                        'strengths': strengths,
+                        'weaknesses': weaknesses,
+                        'text': review_text,
                     }
                     paper['reviews'].append(review_data)
+
+                # 检查是否是 rebuttal / author response
+                elif is_rebuttal:
+                    # 尽量保留作者回应的完整表单内容（Common concerns / Final comments 等可能在不同字段里）
+                    skip_keys = {
+                        "rating",
+                        "recommendation",
+                        "overall_rating",
+                        "score",
+                        "confidence",
+                        "overall_confidence",
+                        "decision",
+                        "title",
+                    }
+                    blocks = []
+                    seen_txt = set()
+                    try:
+                        for k in (reply_content or {}).keys():
+                            if k in skip_keys:
+                                continue
+                            vv = _val(reply_content, k, None)
+                            if not isinstance(vv, str):
+                                continue
+                            ss = vv.strip()
+                            if not ss:
+                                continue
+                            if len(ss) < 3:
+                                continue
+                            if ss in seen_txt:
+                                continue
+                            seen_txt.add(ss)
+
+                            label = str(k).replace("_", " ").strip()
+                            # 常见主字段不额外加 label（直接作为段落），其他字段加 label 方便区分
+                            if label.lower() in {"comment", "text", "reply", "response", "rebuttal", "description"}:
+                                blocks.append(ss)
+                            else:
+                                blocks.append(f"{label}:\n{ss}")
+                    except Exception:
+                        blocks = []
+
+                    main_text = "\n\n".join([x for x in blocks if x]).strip()
+                    if main_text:
+                        try:
+                            cdate = int(reply.get("cdate") or reply.get("tcdate") or 0)
+                        except Exception:
+                            cdate = 0
+                        tag = f"Rebuttal/Response (cdate={cdate})" if cdate else "Rebuttal/Response"
+                        rebuttal_blocks.append(f"{tag}:\n{main_text}".strip())
                 
                 # 检查是否是决策
-                elif is_decision or has_decision:
+                elif is_decision or has_decision or is_meta_review:
                     decision_content = reply_content
                     decision_value = _val(decision_content, 'decision', None)
                     if decision_value is None:
                         decision_value = _val(decision_content, 'recommendation', None)
-                    if decision_value is not None:
+
+                    # 决策说明/理由通常在 comment / metareview / rationale 等字段里
+                    comment = ""
+                    for kk in ["comment", "metareview", "rationale", "decision_reason", "summary"]:
+                        vv = _val(decision_content, kk, None)
+                        if isinstance(vv, str) and vv.strip():
+                            comment = vv.strip()
+                            break
+
+                    decision_text_parts = []
+                    if decision_value is not None and str(decision_value).strip():
+                        decision_text_parts.append(f"Decision: {str(decision_value).strip()}")
+                    if comment:
+                        decision_text_parts.append(comment)
+                    decision_text = "\n\n".join([x for x in decision_text_parts if x]).strip() or None
+
+                    try:
+                        cdate = int(reply.get("cdate") or reply.get("tcdate") or 0)
+                    except Exception:
+                        cdate = 0
+
+                    # 选择“最新的一条 decision note”作为最终 decision
+                    if decision_value is not None and (cdate >= best_decision_cdate):
+                        best_decision_cdate = cdate
                         paper['decision'] = decision_value
                         paper['presentation'] = _parse_presentation(paper.get("decision"))
+
+                    # decision/meta_review 的正文：即使没有 decision_value，也要尽量保留（否则 UI 会觉得“没抓到”）
+                    if decision_text is not None and (cdate >= best_decision_text_cdate):
+                        best_decision_text_cdate = cdate
+                        paper['decision_text'] = decision_text
+
+            if rebuttal_blocks:
+                paper["rebuttal_text"] = "\n\n---\n\n".join(rebuttal_blocks).strip()
+
+            # 若 decision_text 没包含决策标签，但 papers.decision 有值，则前置一下，方便用户阅读
+            try:
+                dv = paper.get("decision")
+                dt = paper.get("decision_text")
+                if dv is not None and isinstance(dt, str) and dt.strip():
+                    if "decision:" not in dt.lower():
+                        paper["decision_text"] = f"Decision: {str(dv).strip()}\n\n{dt.strip()}".strip()
+            except Exception:
+                pass
 
         # 兜底：部分会议把“接收与展示类型”直接写在 submission.content['venue']（例如 "NeurIPS 2024 poster"）
         if paper.get("decision") is None:

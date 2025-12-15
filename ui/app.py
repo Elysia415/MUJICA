@@ -86,30 +86,54 @@ def _apply_theme_vars(theme: str) -> None:
     theme = (theme or "").strip().lower()
     if theme in {"dark", "深色"}:
         vars_css = """
-            --bg: #0b1020;
-            --panel: #0f172a;
-            --panel-2: rgba(15, 23, 42, 0.72);
-            --text: #e5e7eb;
-            --muted: #94a3b8;
-            --border: rgba(148, 163, 184, 0.20);
-            --accent: #ff5c93;
-            --accent-hover: #ff3b82;
-            --shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
-            --sidebar-bg: rgba(15, 23, 42, 0.90);
-            --input-bg: rgba(15, 23, 42, 0.92);
-            --code-bg: rgba(2, 6, 23, 0.72);
+            /* Dark theme (inspired by “深黑 + 酒红高光”视觉) */
+            --bg: #07060b;
+            --bg-glow-1: rgba(185, 0, 60, 0.34);
+            --bg-glow-2: rgba(255, 45, 85, 0.14);
+
+            /* 提高面板对比度（避免“糊成一片”） */
+            --panel: rgba(20, 18, 28, 0.96);
+            --panel-2: rgba(28, 24, 40, 0.90);
+
+            --text: #ffffff;
+            --muted: rgba(255, 255, 255, 0.78);
+
+            --border: rgba(255, 255, 255, 0.22);
+            --shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+
+            --sidebar-bg: rgba(10, 9, 14, 0.96);
+            /* 输入框底色再抬高一档，保证可读性 */
+            --input-bg: rgba(255, 255, 255, 0.07);
+            --code-bg: rgba(0, 0, 0, 0.28);
+
+            --accent: #ff2d55;
+            --accent-2: #b3003a;
+            --accent-hover: #ff4d6d;
+            --accent-2-hover: #d10046;
+            --accent-shadow: rgba(255, 45, 85, 0.22);
+            --accent-shadow-hover: rgba(255, 45, 85, 0.30);
+            --accent-focus: rgba(255, 45, 85, 0.60);
+            --accent-focus-shadow: rgba(255, 45, 85, 0.18);
         """
     else:
         # 默认：浅色粉系（参考截图风格）
         vars_css = """
             --bg: #faf7fb;
+            --bg-glow-1: rgba(255, 92, 147, 0.16);
+            --bg-glow-2: rgba(255, 200, 221, 0.22);
             --panel: #ffffff;
             --panel-2: rgba(255, 255, 255, 0.92);
             --text: #111827;
             --muted: #6b7280;
             --border: rgba(17, 24, 39, 0.12);
             --accent: #ff5c93;
+            --accent-2: #ff3b82;
             --accent-hover: #ff3b82;
+            --accent-2-hover: #ff1f6d;
+            --accent-shadow: rgba(255, 92, 147, 0.16);
+            --accent-shadow-hover: rgba(255, 92, 147, 0.20);
+            --accent-focus: rgba(255, 92, 147, 0.55);
+            --accent-focus-shadow: rgba(255, 92, 147, 0.14);
             --shadow: 0 10px 24px rgba(17, 24, 39, 0.08);
             --sidebar-bg: rgba(255, 255, 255, 0.92);
             --input-bg: rgba(255, 255, 255, 0.98);
@@ -127,20 +151,18 @@ def _ingest_test_dataset(kb: KnowledgeBase, path: str = "data/raw/test_samples.j
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     loader = DataLoader(path)
-    
-    # 1. 如果文件不存在，先创建假数据并保存（这部分保持在 if 里面）
+
+    # 1) 如果文件不存在，先创建假数据并保存
     if not os.path.exists(path):
         sample_papers = [
             {"id": "p1", "title": "Self-Rewarding Language Models", "abstract": "We propose...", "rating": 9.0},
             {"id": "p2", "title": "Direct Preference Optimization", "abstract": "DPO is stable...", "rating": 9.5},
         ]
         loader.save_local_data(sample_papers)
-    
-    # 2. 【关键修改】下面这两行必须向左移动，和 if 对齐
-    # 无论上面是否创建了新文件，这里都要读取数据
-    data = loader.load_local_data() 
+
+    # 2) 无论上面是否创建了新文件，这里都要读取数据并入库
+    data = loader.load_local_data()
     kb.ingest_data(data)
-    
     return int(len(data))
 
 
@@ -491,6 +513,22 @@ def _render_data_dashboard(
     c4.metric("向量 Chunks（LanceDB）", chunks_vec_count)
     st.caption(f"PDF 文件数（data/raw/pdfs）：{pdf_count}")
 
+    c_fix, c_fix_hint = st.columns([1, 3])
+    with c_fix:
+        if st.button("🛠 修复 pdf_path（扫描本地 PDF）", key="kb_repair_pdf_path"):
+            with st.spinner("正在扫描并回填 pdf_path..."):
+                res = kb.repair_pdf_paths(pdf_dir="data/raw/pdfs")
+            if isinstance(res, dict) and res.get("ok"):
+                st.session_state["kb_flash"] = f"已回填 pdf_path：{res.get('updated')}（扫描候选 {res.get('scanned')}）"
+                _rerun()
+            else:
+                st.error(f"修复失败：{res}")
+    with c_fix_hint:
+        st.caption(
+            "当你在“不开启下载 PDF”的情况下重新抓取元数据，旧版本可能会把 SQLite 里的 pdf_path 覆盖为空。"
+            "这个按钮会扫描 `data/raw/pdfs/<paper_id>.pdf` 并回填到 SQLite。"
+        )
+
     with st.expander("查看已入库论文（预览/搜索）", expanded=False):
         if papers_count <= 0:
             st.info("当前知识库为空。请先导入样例或抓取 OpenReview。", icon="ℹ️")
@@ -509,47 +547,76 @@ def _render_data_dashboard(
                 for c in ["id", "title", "year", "rating", "decision", "presentation", "pdf_path", "updated_at"]
                 if c in view.columns
             ]
-            st.dataframe(view[cols].head(500), **_width_kwargs(st.dataframe, stretch=True))
+
+            # --- 表格内选择（勾选） + 删除/详情一体化 ---
+            try:
+                # 切换筛选时清空选择，避免“看不见但被选中”的误删
+                _last_q = str(st.session_state.get("_kb_last_filter_q") or "")
+                if str(q or "") != _last_q:
+                    st.session_state["_kb_last_filter_q"] = str(q or "")
+                    st.session_state["_kb_selected_ids"] = []
+            except Exception:
+                pass
+
+            selected_ids: list[str] = []
+            try:
+                shown = view[cols].head(500).copy()
+                shown.insert(0, "选择", False)
+                # 预填已有选择
+                prev = st.session_state.get("_kb_selected_ids") or []
+                prev_set = set([str(x) for x in prev if str(x).strip()])
+                if "id" in shown.columns and prev_set:
+                    shown["选择"] = shown["id"].astype(str).isin(prev_set)
+
+                edited = st.data_editor(
+                    shown,
+                    key="kb_table_editor",
+                    disabled=[c for c in shown.columns if c != "选择"],
+                    **_width_kwargs(st.data_editor, stretch=True),
+                )
+                try:
+                    selected_ids = (
+                        edited[edited["选择"] == True]["id"]  # noqa: E712
+                        .astype(str)
+                        .tolist()
+                    )
+                except Exception:
+                    selected_ids = []
+                st.session_state["_kb_selected_ids"] = selected_ids
+            except Exception:
+                # 兜底：不支持 data_editor 时退化为只读表
+                st.dataframe(view[cols].head(500), **_width_kwargs(st.dataframe, stretch=True))
+                selected_ids = []
+
+            c_sel1, c_sel2, c_sel3 = st.columns([1, 1, 3])
+            with c_sel1:
+                st.caption(f"已选中：{len(selected_ids)}")
+            with c_sel2:
+                if st.button("清空选择", key="kb_clear_selection", disabled=(not selected_ids)):
+                    st.session_state["_kb_selected_ids"] = []
+                    _rerun()
+            with c_sel3:
+                st.caption("提示：勾选 1 篇会自动显示详情；勾选多篇可直接批量删除。")
 
             st.divider()
-            st.markdown("**批量删除（基于当前筛选结果）**")
-            st.warning("批量删除不可撤销：会删除选中论文的元数据/评审/向量索引（以及可选本地 PDF）。")
-            try:
-                ids_for_batch = view["id"].tolist()[:500] if "id" in view.columns else []
-                titles_for_batch = (
-                    view["title"].fillna("").tolist()[:500] if "title" in view.columns else [""] * len(ids_for_batch)
-                )
-                opts = []
-                for _pid, _title in zip(ids_for_batch, titles_for_batch):
-                    _pid = str(_pid)
-                    _title = str(_title or "")
-                    opts.append(f"{_pid} · {_title[:80]}")
-
-                selected_opts = st.multiselect(
-                    "选择要删除的论文（最多 500 条）",
-                    options=opts,
-                    default=[],
-                    help="先用上面的标题关键词过滤缩小范围，再在这里多选要删除的条目。",
-                )
-                selected_ids = [x.split(" · ", 1)[0] for x in selected_opts if isinstance(x, str)]
-            except Exception:
-                selected_ids = []
+            st.markdown("**删除/操作**")
+            st.warning("删除不可撤销：会删除论文元数据/评审/向量索引（以及可选本地 PDF）。")
 
             batch_delete_pdf = st.checkbox(
                 "同时删除本地 PDF 文件（如果存在）",
                 value=False,
-                key="batch_del_pdf",
+                key="kb_del_pdf_selected",
             )
             batch_confirm = st.checkbox(
                 f"我已确认要删除选中的 {len(selected_ids)} 篇论文",
                 value=False,
-                key="batch_del_confirm",
+                key="kb_del_confirm_selected",
             )
             if st.button(
-                f"批量删除（{len(selected_ids)}）",
+                f"删除选中（{len(selected_ids)}）",
                 type="primary",
                 disabled=(not batch_confirm) or (not selected_ids),
-                key="batch_del_btn",
+                key="kb_del_btn_selected",
                 **_width_kwargs(st.button, stretch=True),
             ):
                 with st.spinner("正在批量删除..."):
@@ -563,46 +630,79 @@ def _render_data_dashboard(
                 else:
                     st.error(f"批量删除失败：{(res or {}).get('error') if isinstance(res, dict) else res}")
 
-            # 单篇详情
-            try:
-                ids = view["id"].tolist()[:500] if "id" in view.columns else []
-                if ids:
-                    pid = st.selectbox("查看单篇详情（paper_id）", options=ids)
-                    paper = kb.get_paper(pid) or {}
-                    reviews = kb.get_reviews(pid) or []
-                    st.markdown(f"**{paper.get('title','')}**")
-                    st.caption(
-                        f"paper_id={pid} · year={paper.get('year')} · rating={paper.get('rating')} · "
-                        f"decision={paper.get('decision')} · presentation={paper.get('presentation')}"
-                    )
-                    if paper.get("abstract"):
-                        st.markdown("**Abstract**")
-                        st.write(paper.get("abstract"))
-                    if reviews:
-                        st.markdown("**Reviews（前 3 条）**")
-                        st.json(reviews[:3], expanded=False)
+            st.divider()
+            st.markdown("**单篇详情**")
+            pid = selected_ids[0] if len(selected_ids) == 1 else None
+            if not pid:
+                if len(selected_ids) > 1:
+                    st.info("当前选中多篇：请只勾选 1 篇以查看单篇详情。", icon="ℹ️")
+                else:
+                    st.info("请在上表勾选 1 篇论文以查看详情。", icon="ℹ️")
+            else:
+                paper = kb.get_paper(pid) or {}
+                reviews = kb.get_reviews(pid) or []
+                st.markdown(f"**{paper.get('title','')}**")
+                st.caption(
+                    f"paper_id={pid} · year={paper.get('year')} · rating={paper.get('rating')} · "
+                    f"decision={paper.get('decision')} · presentation={paper.get('presentation')}"
+                )
+                if paper.get("abstract"):
+                    st.markdown("**Abstract**")
+                    st.write(paper.get("abstract"))
 
-                    st.divider()
-                    st.markdown("**删除条目**")
-                    st.warning("删除不可撤销：将删除该论文的元数据、评审与向量索引（以及可选本地 PDF）。")
-                    delete_pdf = st.checkbox("同时删除本地 PDF 文件（如果存在）", value=False, key=f"del_pdf_{pid}")
-                    confirm = st.checkbox("我已确认要删除这篇论文", value=False, key=f"del_confirm_{pid}")
-                    if st.button("删除该论文", type="primary", disabled=not confirm, key=f"del_btn_{pid}"):
-                        with st.spinner("正在删除..."):
-                            res = kb.delete_paper(pid, delete_pdf=delete_pdf)
-                        if isinstance(res, dict) and res.get("ok"):
-                            msg = f"已删除 paper_id={pid}（reviews={res.get('deleted_sql_reviews')}）"
-                            if delete_pdf:
-                                if res.get("deleted_pdf"):
-                                    msg += " · 本地 PDF 已删除"
-                                elif res.get("pdf_path"):
-                                    msg += " · 本地 PDF 未删除（可能不存在/无权限）"
-                            st.session_state["kb_flash"] = msg
-                            _rerun()
-                        else:
-                            st.error(f"删除失败：{(res or {}).get('error') if isinstance(res, dict) else res}")
-            except Exception:
-                pass
+                decision_text = str(paper.get("decision_text") or "").strip()
+                if decision_text:
+                    # 默认收起，避免长文本占屏
+                    preview = " ".join(decision_text.split())[:120]
+                    title_line = "Decision（最终决策说明）"
+                    if preview:
+                        title_line += f" · {preview}" + ("…" if len(preview) >= 120 else "")
+                    with st.expander(title_line, expanded=False):
+                        st.write(decision_text)
+
+                rebuttal_text = str(paper.get("rebuttal_text") or "").strip()
+                if rebuttal_text:
+                    preview = " ".join(rebuttal_text.split())[:120]
+                    title_line = "Rebuttal / Author Response"
+                    if preview:
+                        title_line += f" · {preview}" + ("…" if len(preview) >= 120 else "")
+                    with st.expander(title_line, expanded=False):
+                        st.write(rebuttal_text)
+
+                if reviews:
+                    st.markdown("**Reviews（前 3 条）**")
+                    for i, r in enumerate(reviews[:3]):
+                        ridx = i + 1
+                        rating_raw = (r.get("rating_raw") if isinstance(r, dict) else None) or ""
+                        conf_raw = (r.get("confidence_raw") if isinstance(r, dict) else None) or ""
+                        title_line = f"Review #{ridx}"
+                        if rating_raw or conf_raw:
+                            title_line += f" · rating={rating_raw} · confidence={conf_raw}"
+                        with st.expander(title_line, expanded=False):
+                            if isinstance(r, dict) and (r.get("text") or "").strip():
+                                st.write((r.get("text") or "").strip())
+                            else:
+                                st.caption("（未解析到评审正文 text：可能是旧数据或该会议字段名不同/权限不足）")
+                                st.json(r, expanded=False)
+
+                st.divider()
+                st.markdown("**删除该论文（单篇）**")
+                delete_pdf = st.checkbox("同时删除本地 PDF 文件（如果存在）", value=False, key=f"del_pdf_{pid}")
+                confirm = st.checkbox("我已确认要删除这篇论文", value=False, key=f"del_confirm_{pid}")
+                if st.button("删除该论文", type="primary", disabled=not confirm, key=f"del_btn_{pid}"):
+                    with st.spinner("正在删除..."):
+                        res = kb.delete_paper(pid, delete_pdf=delete_pdf)
+                    if isinstance(res, dict) and res.get("ok"):
+                        msg = f"已删除 paper_id={pid}（reviews={res.get('deleted_sql_reviews')}）"
+                        if delete_pdf:
+                            if res.get("deleted_pdf"):
+                                msg += " · 本地 PDF 已删除"
+                            elif res.get("pdf_path"):
+                                msg += " · 本地 PDF 未删除（可能不存在/无权限）"
+                        st.session_state["kb_flash"] = msg
+                        _rerun()
+                    else:
+                        st.error(f"删除失败：{(res or {}).get('error') if isinstance(res, dict) else res}")
 
     tab1, tab2 = st.tabs(["导入本地样例", "抓取 OpenReview"])
 
@@ -712,7 +812,15 @@ def _render_data_dashboard(
             10,
             300,
             50,
-            help="当开启“仅 Accept”时，这个上限指 accepted 论文数量；系统会扫描更多 submission 直到凑够或扫完。",
+            help="当开启“仅 Accept”时，这个上限指 accepted 论文数量；系统会扫描更多 submission 直到凑够或扫完。"
+            "当开启“追加抓取（只抓新论文）”时，这个上限指“新增论文数量”。",
+        )
+
+        skip_existing = st.checkbox(
+            "追加抓取（只抓新论文，跳过已入库 paper_id）",
+            value=False,
+            help="开启后：如果你库里已经有 300 篇，再抓 300 会尽量再新增 300 篇（会扫描更多 submission）。"
+            "关闭则表示“刷新/补全已有论文元数据”。",
         )
 
         presentation_in = None
@@ -753,6 +861,27 @@ def _render_data_dashboard(
         # Advanced knobs（可选）
         # ---------------------------
         with st.expander("高级（速度/稳定性，可选）", expanded=False):
+            st.markdown("**OpenReview 认证（可选）**")
+            st.caption("部分会议的评审/回复需要登录后才能通过 API 获取；不填也能抓论文元数据与 PDF。")
+            or_user = st.text_input(
+                "OpenReview Username（可选）",
+                value=str(os.getenv("OPENREVIEW_USERNAME", "") or ""),
+                help="也可通过环境变量 OPENREVIEW_USERNAME 设置。",
+            )
+            or_pass = st.text_input(
+                "OpenReview Password（可选）",
+                value=str(os.getenv("OPENREVIEW_PASSWORD", "") or ""),
+                type="password",
+                help="也可通过环境变量 OPENREVIEW_PASSWORD 设置。不会写入磁盘，仅在当前进程生效。",
+            )
+            force_replace_reviews = st.checkbox(
+                "强制刷新 Reviews（允许覆盖为空，MUJICA_REPLACE_EMPTY_REVIEWS）",
+                value=(os.getenv("MUJICA_REPLACE_EMPTY_REVIEWS", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"},
+                help="用于修复历史数据/误分类：如果你发现 Reviews 里混进了 Rebuttal/Author Response，"
+                "勾上一次可以允许本次抓取结果覆盖旧 reviews（即使本次抓不到 reviews，也会清空旧的）。",
+            )
+
+            st.divider()
             page_size = st.number_input(
                 "OpenReview 分页大小（MUJICA_OPENREVIEW_PAGE_SIZE）",
                 min_value=20,
@@ -816,8 +945,8 @@ def _render_data_dashboard(
 
         with st.expander("本次会写入哪些内容？", expanded=False):
             st.markdown(
-                "- **SQLite**：title/authors/keywords/year/decision/presentation/rating/reviews/pdf_url/pdf_path\n"
-                "- **LanceDB**：paper 向量 + chunks（含 meta chunk；若勾选解析则含全文 chunks）"
+                "- **SQLite**：title/authors/keywords/year/decision/decision_text/rebuttal_text/presentation/rating/reviews/pdf_url/pdf_path\n"
+                "- **LanceDB**：paper 向量 + chunks（含 meta chunk；含 decision/rebuttal/review chunks；若勾选解析则含全文 chunks）"
             )
 
         st.caption("配置预览（你点开始前可以快速确认）：")
@@ -830,6 +959,7 @@ def _render_data_dashboard(
                 "download_pdfs": download_pdfs,
                 "parse_pdfs": parse_pdfs,
                 "max_pdf_pages": max_pages if parse_pdfs else None,
+                "force_replace_reviews": force_replace_reviews,
             },
             expanded=False,
         )
@@ -841,6 +971,11 @@ def _render_data_dashboard(
 
             # 将高级参数写入环境变量（fetcher 内部按 env 读取）
             try:
+                if str(or_user or "").strip():
+                    os.environ["OPENREVIEW_USERNAME"] = str(or_user).strip()
+                if str(or_pass or "").strip():
+                    os.environ["OPENREVIEW_PASSWORD"] = str(or_pass).strip()
+                os.environ["MUJICA_REPLACE_EMPTY_REVIEWS"] = "1" if force_replace_reviews else "0"
                 os.environ["MUJICA_OPENREVIEW_PAGE_SIZE"] = str(int(page_size))
                 os.environ["MUJICA_PDF_DOWNLOAD_WORKERS"] = str(int(pdf_workers))
                 os.environ["MUJICA_PDF_DOWNLOAD_TIMEOUT"] = str(float(pdf_timeout))
@@ -882,10 +1017,14 @@ def _render_data_dashboard(
 
             with st.status("正在抓取 OpenReview...", expanded=True) as status:
                 st.write("抓取 / 下载 / 解析 / 建索引 ...")
+                fetch_bar = st.progress(0)
+                fetch_text = st.empty()
                 dl_bar = st.progress(0)
                 dl_text = st.empty()
                 parse_bar = st.progress(0)
                 parse_text = st.empty()
+                embed_bar = st.progress(0)
+                embed_text = st.empty()
 
                 def _on_progress(payload):
                     if not isinstance(payload, dict):
@@ -893,10 +1032,17 @@ def _render_data_dashboard(
                     stage = payload.get("stage")
                     cur = int(payload.get("current") or 0)
                     tot = int(payload.get("total") or 0)
-                    if tot <= 0:
+                    # 某些阶段没有 total（或 total=0），这里不强制 return
+                    pct = int(cur * 100 / tot) if tot > 0 else 0
+
+                    if stage == "fetch_papers":
+                        if tot > 0:
+                            fetch_bar.progress(min(100, max(0, pct)))
+                        scanned = payload.get("scanned")
+                        suffix = f"（扫描 {scanned}）" if scanned is not None else ""
+                        fetch_text.caption(f"抓取元数据：{cur}/{tot}{suffix}")
                         return
 
-                    pct = int(cur * 100 / tot)
                     if stage == "download_pdf":
                         dl_bar.progress(min(100, max(0, pct)))
                         dl_text.caption(f"下载 PDF：{cur}/{tot}")
@@ -908,11 +1054,54 @@ def _render_data_dashboard(
                         parse_text.caption(f"解析 PDF：{cur}/{tot} · {title[:60]}")
                         return
 
+                    if stage in {"write_papers_table", "prepare_chunks", "prepare_chunks_done"}:
+                        # 这些阶段发生在 Embedding chunks 之前，容易让人误以为“卡住”
+                        if stage == "write_papers_table":
+                            state = payload.get("state")
+                            rows = payload.get("rows")
+                            if state == "start":
+                                embed_text.caption(f"写入向量表（papers）：rows={rows} ...")
+                            else:
+                                dt = payload.get("elapsed")
+                                try:
+                                    embed_text.caption(f"写入向量表（papers）完成：rows={rows} · dt={float(dt):.2f}s")
+                                except Exception:
+                                    embed_text.caption(f"写入向量表（papers）完成：rows={rows}")
+                            return
+
+                        if stage == "prepare_chunks":
+                            chunks = payload.get("chunks")
+                            if tot > 0:
+                                embed_bar.progress(min(100, max(0, pct)))
+                            extra = f" · chunks≈{chunks}" if chunks is not None else ""
+                            embed_text.caption(f"准备 chunks（切分文本）：{cur}/{tot}{extra}")
+                            return
+
+                        if stage == "prepare_chunks_done":
+                            chunks = payload.get("chunks")
+                            dt = payload.get("elapsed")
+                            try:
+                                embed_text.caption(f"准备 chunks 完成：chunks={chunks} · dt={float(dt):.1f}s")
+                            except Exception:
+                                embed_text.caption(f"准备 chunks 完成：chunks={chunks}")
+                            return
+
+                    if stage in {"embed_papers", "embed_chunks"}:
+                        if tot > 0:
+                            embed_bar.progress(min(100, max(0, pct)))
+                        which = "papers" if stage == "embed_papers" else "chunks"
+                        b = payload.get("batch")
+                        bs = payload.get("batches")
+                        extra = f" · batch {b}/{bs}" if b and bs else ""
+                        embed_text.caption(f"Embedding {which}：{cur}/{tot}{extra}")
+                        return
+
                 papers = ingestor.ingest_venue(
                     venue_id=venue_id,
                     limit=limit,
                     accepted_only=accepted_only,
                     presentation_in=presentation_in,
+                    skip_existing=skip_existing,
                     download_pdfs=download_pdfs,
                     parse_pdfs=parse_pdfs,
                     max_pdf_pages=max_pages if parse_pdfs else None,
@@ -926,7 +1115,13 @@ def _render_data_dashboard(
             try:
                 decided = sum(1 for p in (papers or []) if (p or {}).get("decision"))
                 rated = sum(1 for p in (papers or []) if (p or {}).get("rating") is not None)
-                st.success(f"成功入库 {len(papers)} 篇论文（decision={decided} · rating={rated}）")
+                reviewed = sum(1 for p in (papers or []) if (p or {}).get("reviews"))
+                rebuttals = sum(1 for p in (papers or []) if str((p or {}).get("rebuttal_text") or "").strip())
+                decision_notes = sum(1 for p in (papers or []) if str((p or {}).get("decision_text") or "").strip())
+                st.success(
+                    f"成功入库 {len(papers)} 篇论文（decision={decided} · rating={rated} · reviews={reviewed} · "
+                    f"decision_note={decision_notes} · rebuttal={rebuttals}）"
+                )
             except Exception:
                 st.success(f"成功入库 {len(papers)} 篇论文。")
 
@@ -986,8 +1181,18 @@ def _render_research_agent(
         # 兼容 Streamlit 1.26：st.container 不支持 border 参数
         # 这里用 st.form 做“卡片容器”，再用 CSS 把 form 渲染成卡片。
         with st.form("landing_card", clear_on_submit=False):
-            topic = st.text_input("文章主题", placeholder="例如：用综述研究 量子计算", key="landing_topic")
-            keywords = st.text_input("检索关键词（可选）", placeholder="例如：DPO, alignment, preference", key="landing_keywords")
+            topic = st.text_input(
+                "研究问题 / 报告主题",
+                placeholder="例如：对比 NeurIPS 2024 高分 vs 低分论文的评审关注点差异",
+                key="landing_topic",
+                help="用于生成研究计划与报告结构（相当于你想让系统回答的问题）。",
+            )
+            keywords = st.text_input(
+                "辅助关键词（可选）",
+                placeholder="例如：DPO, alignment, preference；或：robustness, backdoor, elicitation",
+                key="landing_keywords",
+                help="可补充你关心的术语/子方向；会与研究问题一起作为检索提示（不是硬过滤）。",
+            )
 
             c1, c2, c3 = st.columns([1, 1, 1])
             with c1:
@@ -1020,11 +1225,11 @@ def _render_research_agent(
 
         if do_run:
             if not (topic or "").strip():
-                st.warning("请先填写「文章主题」。")
+                st.warning("请先填写「研究问题 / 报告主题」。")
             else:
                 q = topic.strip()
                 if (keywords or "").strip():
-                    q = f"{q}\n关键词：{keywords.strip()}"
+                    q = f"{q}\n辅助关键词：{keywords.strip()}"
                 st.session_state["pending_user_query"] = q
                 _rerun()
 
@@ -1314,15 +1519,54 @@ def _render_research_agent(
                                     ev = payload.get("evidence")
                                     sp = payload.get("selected_papers")
                                     dt = payload.get("elapsed")
-                                    research_text.caption(f"完成：{cur}/{tot} · {sec} · papers={sp} · evidence={ev} · {dt:.1f}s")
+                                    research_text.caption(
+                                        f"完成：{cur}/{tot} · {sec} · papers={sp} · evidence={ev} · {dt:.1f}s"
+                                    )
 
                             notes = researcher.execute_research(plan, on_progress=_on_research_progress)
                             research_bar.progress(100)
                             st.session_state["research_notes"] = notes
 
                             st.write("循证写作（Write）...")
-                            report = writer.write_report(plan, notes)
+                            write_text = st.empty()
+
+                            def _on_write_progress(payload):
+                                if not isinstance(payload, dict):
+                                    return
+                                stage = payload.get("stage")
+                                if stage == "write_refs_built":
+                                    write_text.caption(f"写作准备：refs={payload.get('refs_total')}")
+                                elif stage == "write_payload_built":
+                                    write_text.caption(
+                                        f"写作准备：sections={payload.get('sections')} · evidence={payload.get('evidence_snippets')} · refs={payload.get('allowed_refs_total')}"
+                                    )
+                                elif stage == "write_llm_call":
+                                    pc = payload.get("prompt_chars")
+                                    write_text.caption(f"LLM 生成中：model={payload.get('model')} · prompt_chars={pc}")
+                                elif stage == "write_done":
+                                    dt = payload.get("dt_llm_sec")
+                                    used = payload.get("refs_used")
+                                    total = payload.get("refs_total")
+                                    cov = payload.get("coverage")
+                                    tok = payload.get("total_tokens")
+                                    extra = f" · tokens={tok}" if tok is not None else ""
+                                    try:
+                                        cov_pct = f"{float(cov) * 100:.0f}%" if cov is not None else "?"
+                                    except Exception:
+                                        cov_pct = "?"
+                                    write_text.caption(
+                                        f"写作完成：refs={used}/{total} · 引用覆盖≈{cov_pct} · dt={dt:.1f}s{extra}"
+                                    )
+                                elif stage == "write_error":
+                                    write_text.caption(f"写作失败：{payload.get('error')}")
+
+                            report, ref_ctx = writer.write_report(plan, notes, on_progress=_on_write_progress)
                             st.session_state["final_report"] = report
+                            st.session_state["report_ref_ctx"] = ref_ctx
+                            try:
+                                st.session_state["writer_stats"] = (ref_ctx or {}).get("writer_stats")
+                            except Exception:
+                                st.session_state["writer_stats"] = None
 
                             st.write("逐句核查（Verify）...")
                             chunk_map = {}
@@ -1333,7 +1577,12 @@ def _render_research_agent(
                                     if cid and txt and cid not in chunk_map:
                                         chunk_map[cid] = txt
 
-                            verification = verifier.verify_report(report, {"chunks": chunk_map})
+                            ref_map = {}
+                            try:
+                                ref_map = (ref_ctx or {}).get("ref_map") or {}
+                            except Exception:
+                                ref_map = {}
+                            verification = verifier.verify_report(report, {"chunks": chunk_map, "ref_map": ref_map})
                             st.session_state["verification_result"] = verification
 
                             status.update(label="Completed", state="complete")
@@ -1351,7 +1600,23 @@ def _render_research_agent(
         if st.session_state.get("final_report"):
             st.divider()
             st.subheader("最终报告")
-            st.markdown(st.session_state["final_report"])
+
+            report_md = str(st.session_state.get("final_report") or "")
+            c_dl1, c_dl2 = st.columns([1, 3])
+            with c_dl1:
+                st.download_button(
+                    "⬇️ 下载报告（.md）",
+                    data=report_md.encode("utf-8"),
+                    file_name="mujica_report.md",
+                    mime="text/markdown",
+                )
+            with c_dl2:
+                show_raw = st.checkbox("显示 Markdown 源码", value=False, key="show_report_raw")
+
+            if show_raw:
+                st.code(report_md, language="markdown")
+            else:
+                st.markdown(report_md)
 
             v = st.session_state.get("verification_result")
             if isinstance(v, dict) and v:
@@ -1365,7 +1630,36 @@ def _render_research_agent(
         with tab_evi:
             notes = st.session_state.get("research_notes") or []
             if not notes:
-                st.info("暂无证据。请先导入数据，再在底部输入问题。", icon="ℹ️")
+                # 更具体的空态引导：告诉用户“证据是什么 + 下一步怎么做”
+                st.info(
+                    "暂无证据片段。证据会在你点击「确认并运行」后生成：来自论文的摘要/正文/评审/决策/作者回复等文本片段，"
+                    "并在报告里以引用 [R#] 形式可溯源。",
+                    icon="ℹ️",
+                )
+                try:
+                    st.caption(f"当前知识库：papers={kb_papers} · chunks={chunks_rows}")
+                except Exception:
+                    pass
+
+                c_go1, c_go2 = st.columns(2)
+                with c_go1:
+                    if st.button("📚 去知识库入库/管理数据", key="evi_go_data"):
+                        _set_system_mode("data")
+                        _rerun()
+                with c_go2:
+                    if st.button("🧪 一键导入样例数据", key="evi_ingest_samples"):
+                        with st.spinner("正在导入样例数据..."):
+                            _ingest_test_dataset(kb)
+                        st.session_state["kb_flash"] = "已导入样例数据。现在可以回到首页提问并运行。"
+                        _set_system_mode("research")
+                        _rerun()
+
+                st.markdown(
+                    "**建议步骤**：\n"
+                    "1) 在「📚 知识库」页抓取 OpenReview 或导入样例 →\n"
+                    "2) 回到首页输入研究问题 →\n"
+                    "3) 审核计划后点「确认并运行」，这里就会显示证据。"
+                )
             else:
                 for note in notes:
                     section_name = note.get("section", "Section")
@@ -1382,12 +1676,22 @@ def _render_research_agent(
                         if not evidence:
                             st.markdown("*No evidence snippets for this section.*")
                         else:
+                            ref_ctx = st.session_state.get("report_ref_ctx") or {}
+                            chunk_to_ref = {}
+                            try:
+                                chunk_to_ref = (ref_ctx or {}).get("chunk_to_ref") or {}
+                            except Exception:
+                                chunk_to_ref = {}
                             for e in evidence:
                                 pid = e.get("paper_id")
                                 title = e.get("title", "")
                                 cid = e.get("chunk_id")
                                 src = e.get("source")
-                                st.markdown(f"**{title}**  \n`paper_id={pid}` · `chunk_id={cid}` · `source={src}`")
+                                rid = chunk_to_ref.get(cid)
+                                rid_disp = f"`ref={rid}` · " if rid else ""
+                                st.markdown(
+                                    f"**{title}**  \n{rid_disp}`paper_id={pid}` · `chunk_id={cid}` · `source={src}`"
+                                )
                                 st.code((e.get("text") or "")[:1200])
 
         with tab_ver:
@@ -1434,6 +1738,8 @@ def main() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("research_notes", [])
     st.session_state.setdefault("final_report", "")
+    st.session_state.setdefault("report_ref_ctx", None)
+    st.session_state.setdefault("writer_stats", None)
     st.session_state.setdefault("pending_plan", None)
     st.session_state.setdefault("plan_editor_text", "")
     st.session_state.setdefault("plan_approved", False)
@@ -1453,7 +1759,7 @@ def main() -> None:
             options=["light", "dark"],
             key="ui_theme",
             horizontal=True,
-            format_func=lambda x: "浅色" if x == "light" else "深色",
+            format_func=lambda x: "简明" if x == "light" else "MUJICA",
         )
         st.radio(
             "导航",

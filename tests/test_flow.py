@@ -98,7 +98,6 @@ class FakeLLM:
                         sections = []
 
                     lines = ["# Offline Test Report"]
-                    cited = set()
                     for s in sections or []:
                         sec_name = s.get("section") or "Section"
                         lines.append(f"## {sec_name}")
@@ -107,26 +106,14 @@ class FakeLLM:
                         if kps:
                             for kp in kps:
                                 point = kp.get("point", "")
-                                cits = kp.get("citations") or []
-                                if cits:
-                                    pid = cits[0].get("paper_id")
-                                    cid = cits[0].get("chunk_id")
+                                refs = kp.get("refs") or []
+                                if refs:
+                                    rid = refs[0]
                                 else:
-                                    ac = (s.get("allowed_citations") or [{}])[0]
-                                    pid = ac.get("paper_id")
-                                    cid = ac.get("chunk_id")
-                                if pid and cid:
-                                    cited.add(pid)
-                                    lines.append(f"- {point} [Paper ID: {pid} | Chunk: {cid}]")
-                                else:
-                                    lines.append(f"- {point}")
+                                    rid = (s.get("allowed_refs") or ["R1"])[0]
+                                lines.append(f"- {point} [{rid}]")
                         else:
                             lines.append(s.get("summary") or "证据不足。")
-
-                    if cited:
-                        lines.append("## References")
-                        for pid in sorted(cited):
-                            lines.append(f"- {pid}")
                     return _FakeResp("\n".join(lines))
 
                 return _FakeResp("")
@@ -173,8 +160,8 @@ def test_full_chain_offline(tmp_path, monkeypatch):
     assert notes and notes[0].get("evidence"), "Researcher should output evidence snippets"
 
     writer = WriterAgent(llm)
-    report = writer.write_report(plan, notes)
-    assert "[Paper ID:" in report and "| Chunk:" in report, "Report should contain chunk-level citations"
+    report, ref_ctx = writer.write_report(plan, notes)
+    assert "[R" in report and "]" in report, "Report should contain ref-style citations like [R1]"
 
     chunk_map = {}
     for n in notes:
@@ -183,5 +170,8 @@ def test_full_chain_offline(tmp_path, monkeypatch):
                 chunk_map[e["chunk_id"]] = e["text"]
 
     verifier = VerifierAgent(llm)
-    verification = verifier.verify_report(report, {"chunks": chunk_map, "max_claims": 5})
+    verification = verifier.verify_report(
+        report,
+        {"chunks": chunk_map, "ref_map": (ref_ctx or {}).get("ref_map") or {}, "max_claims": 5},
+    )
     assert verification["is_valid"] is True

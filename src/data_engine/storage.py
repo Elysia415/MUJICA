@@ -90,6 +90,8 @@ class KnowledgeBase:
                 pdf_url TEXT,
                 pdf_path TEXT,
                 decision TEXT,
+                decision_text TEXT,
+                rebuttal_text TEXT,
                 presentation TEXT,
                 rating REAL,
                 raw_json TEXT,
@@ -109,6 +111,7 @@ class KnowledgeBase:
                 summary TEXT,
                 strengths TEXT,
                 weaknesses TEXT,
+                text TEXT,
                 raw_json TEXT,
                 PRIMARY KEY (paper_id, idx)
             )
@@ -123,14 +126,30 @@ class KnowledgeBase:
             if "presentation" not in cols:
                 cur.execute("ALTER TABLE papers ADD COLUMN presentation TEXT")
                 self._meta_conn.commit()
+            if "decision_text" not in cols:
+                cur.execute("ALTER TABLE papers ADD COLUMN decision_text TEXT")
+                self._meta_conn.commit()
+            if "rebuttal_text" not in cols:
+                cur.execute("ALTER TABLE papers ADD COLUMN rebuttal_text TEXT")
+                self._meta_conn.commit()
         except Exception:
             # 忽略迁移失败（最坏情况：不会存 presentation）
+            pass
+
+        # reviews 表迁移：补齐 text 字段（用于保存评审意见正文）
+        try:
+            cols_r = [r["name"] for r in cur.execute("PRAGMA table_info(reviews)").fetchall()]
+            if "text" not in cols_r:
+                cur.execute("ALTER TABLE reviews ADD COLUMN text TEXT")
+                self._meta_conn.commit()
+        except Exception:
+            # 忽略迁移失败（最坏情况：只保留 raw_json）
             pass
 
     # ---------------------------
     # Ingest
     # ---------------------------
-    def ingest_data(self, papers: List[Dict[str, Any]]) -> None:
+    def ingest_data(self, papers: List[Dict[str, Any]], *, on_progress: Optional[Any] = None) -> None:
         """
         Ingest 论文到知识库。
 
@@ -148,10 +167,29 @@ class KnowledgeBase:
         # 1) 写入结构化元数据（SQLite）
         for p in papers:
             self._upsert_paper_and_reviews(p)
+        if callable(on_progress):
+            try:
+                on_progress({"stage": "ingest_metadata", "current": len(papers), "total": len(papers)})
+            except Exception:
+                pass
 
         # Embedding 批大小（部分 OpenAI-compatible 网关对单次请求 input 数量有限制，常见为 64）
         batch_size = int(os.getenv("MUJICA_EMBEDDING_BATCH_SIZE", "64") or 64)
         batch_size = max(1, min(batch_size, 256))
+
+        # 是否把评审意见也向量化（默认开启；可用 MUJICA_INGEST_REVIEWS=0 关闭）
+        ingest_reviews = (os.getenv("MUJICA_INGEST_REVIEWS", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        try:
+            max_reviews_per_paper = int(os.getenv("MUJICA_MAX_REVIEWS_PER_PAPER", "10") or 10)
+        except Exception:
+            max_reviews_per_paper = 10
+        max_reviews_per_paper = max(0, min(max_reviews_per_paper, 50))
 
         # Embedding 日志频率：每 N 个 batch 打印一次进度（默认 10；设为 1 会非常详细）
         try:
@@ -221,6 +259,24 @@ class KnowledgeBase:
                         f"batch {bi+1}/{total_batches} size={len(batch)} ok={ok} empty={empty} dt={dt:.1f}s"
                     )
 
+                if callable(on_progress):
+                    try:
+                        done = min(start + len(batch), total)
+                        on_progress(
+                            {
+                                "stage": "embed_papers",
+                                "current": done,
+                                "total": total,
+                                "batch": bi + 1,
+                                "batches": total_batches,
+                                "ok": ok,
+                                "empty": empty,
+                                "elapsed": time.time() - t0,
+                            }
+                        )
+                    except Exception:
+                        pass
+
             print(
                 f"[Embedding] papers done: ok={ok_total}/{total} empty={empty_total} elapsed={time.time()-t0:.1f}s"
             )
@@ -232,6 +288,19 @@ class KnowledgeBase:
                 paper_rows.append(row)
 
         if paper_rows:
+            t_write_papers = time.time()
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "write_papers_table",
+                            "state": "start",
+                            "rows": len(paper_rows),
+                        }
+                    )
+                except Exception:
+                    pass
+            print(f"[LanceDB] papers table upsert: rows={len(paper_rows)}")
             if self.papers_table in self.db.table_names():
                 tbl = self.db.open_table(self.papers_table)
 
@@ -250,6 +319,10 @@ class KnowledgeBase:
                 needs_rebuild = (year_type == "null") or (existing_dim > 0 and expected_dim > 0 and existing_dim != expected_dim)
 
                 if needs_rebuild:
+                    print(
+                        f"[LanceDB] papers table schema mismatch -> rebuild (year_type={year_type or 'n/a'} "
+                        f"existing_dim={existing_dim} expected_dim={expected_dim})"
+                    )
                     ids_set = set([r["id"] for r in paper_rows])
                     try:
                         old_rows = tbl.to_list()
@@ -323,18 +396,65 @@ class KnowledgeBase:
                 )
                 self.db.create_table(self.papers_table, data=paper_rows, schema=schema)
 
+            dt_write_papers = time.time() - t_write_papers
+            print(f"[LanceDB] papers table done: dt={dt_write_papers:.2f}s")
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "write_papers_table",
+                            "state": "done",
+                            "rows": len(paper_rows),
+                            "elapsed": dt_write_papers,
+                        }
+                    )
+                except Exception:
+                    pass
+
         # 3) 写入 chunk-level 向量（用于证据溯源）
+        # 说明：这一步包含“构建 chunk_rows（切分文本）”与“向量化 + 写入 LanceDB”。
+        # 以前两步之间缺少日志，可能导致用户误以为卡住。
+        try:
+            prep_log_every = int(os.getenv("MUJICA_CHUNK_PREP_LOG_EVERY", "50") or 50)
+        except Exception:
+            prep_log_every = 50
+        prep_log_every = max(0, min(prep_log_every, 10_000))
+
+        print(
+            f"[Chunking] prepare chunks: papers={len(papers)} max_tokens={self.chunk_max_tokens} "
+            f"overlap={self.chunk_overlap_tokens} reviews={'on' if ingest_reviews else 'off'} "
+            f"max_reviews_per_paper={max_reviews_per_paper}"
+        )
+        t_prep = time.time()
+        papers_total = sum(1 for p in papers if str((p or {}).get("id") or "").strip())
+        if callable(on_progress):
+            try:
+                on_progress({"stage": "prepare_chunks", "current": 0, "total": papers_total, "chunks": 0})
+            except Exception:
+                pass
+
         chunk_rows = []
+        from collections import Counter
+
+        src_counter = Counter()
+        papers_done = 0
         for p in papers:
             pid = str(p.get("id") or "").strip()
             if not pid:
                 continue
+            papers_done += 1
 
             sources: List[tuple[str, str]] = []
             title = (p.get("title") or "").strip()
             abstract = (p.get("abstract") or "").strip()
             tldr = (p.get("tldr") or "").strip()
             content = (p.get("content") or "").strip()
+            reviews = p.get("reviews") or []
+            if not isinstance(reviews, list):
+                reviews = []
+
+            decision_text = str(p.get("decision_text") or "").strip()
+            rebuttal_text = str(p.get("rebuttal_text") or "").strip()
 
             # 删除该 paper 旧 chunks（避免重复）
             # 关键：当本次没有提供 content（未解析全文）时，保留历史 full_text chunks，避免“补元数据”时把全文证据删掉。
@@ -345,7 +465,20 @@ class KnowledgeBase:
                     if content:
                         tbl.delete(f"paper_id = '{safe_pid}'")
                     else:
-                        tbl.delete(f"paper_id = '{safe_pid}' AND source != 'full_text'")
+                        # 只更新“本次要写入”的 sources，避免把历史 full_text / reviews 误删掉
+                        tbl.delete(
+                            f"paper_id = '{safe_pid}' AND source IN ('meta', 'title_abstract', 'tldr')"
+                        )
+                        # 仅当本次确实拿到了 reviews 时，才重建 review chunks；否则保留历史 review chunks
+                        if ingest_reviews and reviews and max_reviews_per_paper > 0:
+                            srcs = [f"review_{i}" for i in range(max_reviews_per_paper)]
+                            srcs_sql = ", ".join([f"'{s}'" for s in srcs])
+                            tbl.delete(f"paper_id = '{safe_pid}' AND source IN ({srcs_sql})")
+                        # 仅当本次确实拿到了 decision/rebuttal 文本时，才重建对应 chunks；否则保留历史
+                        if decision_text:
+                            tbl.delete(f"paper_id = '{safe_pid}' AND source = 'decision'")
+                        if rebuttal_text:
+                            tbl.delete(f"paper_id = '{safe_pid}' AND source = 'rebuttal'")
                 except Exception:
                     pass
 
@@ -371,6 +504,8 @@ class KnowledgeBase:
                 meta_lines.append(f"Venue: {p.get('venue_id')}")
             if p.get("decision") is not None:
                 meta_lines.append(f"Decision: {p.get('decision')}")
+            if decision_text:
+                meta_lines.append("Decision Note: yes")
             if p.get("presentation") is not None:
                 meta_lines.append(f"Presentation: {p.get('presentation')}")
             if p.get("rating") is not None:
@@ -379,8 +514,7 @@ class KnowledgeBase:
                 meta_lines.append(f"PDF: {p.get('pdf_url')}")
             if p.get("pdf_path"):
                 meta_lines.append(f"PDF Path: {p.get('pdf_path')}")
-            reviews = p.get("reviews") or []
-            if isinstance(reviews, list) and reviews:
+            if reviews:
                 meta_lines.append(f"Reviews: {len(reviews)}")
 
             meta_text = "\n".join([x for x in meta_lines if x]).strip()
@@ -391,6 +525,38 @@ class KnowledgeBase:
                 sources.append(("title_abstract", f"Title: {title}\nAbstract: {abstract}".strip()))
             if tldr:
                 sources.append(("tldr", tldr))
+            if decision_text:
+                sources.append(("decision", decision_text))
+            if rebuttal_text:
+                sources.append(("rebuttal", rebuttal_text))
+
+            # reviews：将每条评审也做成可检索、可引用的 chunk（review_0/review_1/...）
+            if ingest_reviews:
+                reviews = p.get("reviews") or []
+                if isinstance(reviews, list) and reviews and max_reviews_per_paper > 0:
+                    for ridx, r in enumerate(reviews[:max_reviews_per_paper]):
+                        if not isinstance(r, dict):
+                            continue
+                        r_text = (r.get("text") or "").strip()
+                        if not r_text:
+                            # 兼容旧数据：只给了 summary/strengths/weaknesses
+                            parts = []
+                            if r.get("rating_raw") not in (None, "", "N/A"):
+                                parts.append(f"Rating: {r.get('rating_raw')}")
+                            if r.get("confidence_raw") not in (None, "", "N/A"):
+                                parts.append(f"Confidence: {r.get('confidence_raw')}")
+                            for kk, label in [
+                                ("summary", "Summary"),
+                                ("strengths", "Strengths"),
+                                ("weaknesses", "Weaknesses"),
+                            ]:
+                                vv = (r.get(kk) or "").strip()
+                                if vv:
+                                    parts.append(f"{label}:\n{vv}")
+                            r_text = "\n\n".join(parts).strip()
+                        if r_text:
+                            sources.append((f"review_{ridx}", r_text))
+
             if content:
                 sources.append(("full_text", content))
 
@@ -400,6 +566,8 @@ class KnowledgeBase:
                     max_tokens=self.chunk_max_tokens,
                     overlap_tokens=self.chunk_overlap_tokens,
                 )
+                if chunks:
+                    src_counter[source_name] += len(chunks)
                 for i, c in enumerate(chunks):
                     chunk_rows.append(
                         {
@@ -410,6 +578,49 @@ class KnowledgeBase:
                             "text": c,
                         }
                     )
+
+            # chunk 准备进度
+            if papers_total > 0 and prep_log_every > 0 and (
+                papers_done == 1 or papers_done % prep_log_every == 0 or papers_done == papers_total
+            ):
+                dt = time.time() - t_prep
+                print(
+                    f"[Chunking] prepared: {papers_done}/{papers_total} papers "
+                    f"chunks={len(chunk_rows)} dt={dt:.1f}s"
+                )
+            if callable(on_progress):
+                try:
+                    on_progress(
+                        {
+                            "stage": "prepare_chunks",
+                            "current": papers_done,
+                            "total": papers_total,
+                            "chunks": len(chunk_rows),
+                            "elapsed": time.time() - t_prep,
+                        }
+                    )
+                except Exception:
+                    pass
+
+        dt_prep = time.time() - t_prep
+        try:
+            top_src = dict(src_counter.most_common(8))
+        except Exception:
+            top_src = {}
+        print(f"[Chunking] prepare done: papers={papers_done} chunks={len(chunk_rows)} dt={dt_prep:.1f}s sources={top_src}")
+        if callable(on_progress):
+            try:
+                on_progress(
+                    {
+                        "stage": "prepare_chunks_done",
+                        "papers": papers_done,
+                        "chunks": len(chunk_rows),
+                        "elapsed": dt_prep,
+                        "sources_top": top_src,
+                    }
+                )
+            except Exception:
+                pass
 
         if chunk_rows:
             texts = [r["text"] for r in chunk_rows]
@@ -457,6 +668,24 @@ class KnowledgeBase:
                         f"dt={dt:.1f}s rate={rate:.1f}/s"
                     )
 
+                if callable(on_progress):
+                    try:
+                        done = min(start + len(batch_texts), total)
+                        on_progress(
+                            {
+                                "stage": "embed_chunks",
+                                "current": done,
+                                "total": total,
+                                "batch": bi + 1,
+                                "batches": total_batches,
+                                "ok": ok,
+                                "empty": empty,
+                                "elapsed": time.time() - t0,
+                            }
+                        )
+                    except Exception:
+                        pass
+
             print(
                 f"[Embedding] chunks done: ok={ok_total}/{total} empty={empty_total} elapsed={time.time()-t0:.1f}s"
             )
@@ -498,6 +727,8 @@ class KnowledgeBase:
             p.get("pdf_url"),
             p.get("pdf_path"),
             p.get("decision"),
+            p.get("decision_text"),
+            p.get("rebuttal_text"),
             p.get("presentation"),
             p.get("rating"),
             json.dumps(p, ensure_ascii=False),
@@ -509,11 +740,11 @@ class KnowledgeBase:
             INSERT INTO papers (
                 id, title, abstract, tldr, authors_json, keywords_json,
                 year, venue_id, forum, number, pdf_url, pdf_path,
-                decision, presentation, rating, raw_json, updated_at
+                decision, decision_text, rebuttal_text, presentation, rating, raw_json, updated_at
             ) VALUES (
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, CURRENT_TIMESTAMP
+                ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
             )
             ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
@@ -521,45 +752,75 @@ class KnowledgeBase:
                 tldr=excluded.tldr,
                 authors_json=excluded.authors_json,
                 keywords_json=excluded.keywords_json,
-                year=excluded.year,
-                venue_id=excluded.venue_id,
-                forum=excluded.forum,
-                number=excluded.number,
-                pdf_url=excluded.pdf_url,
-                pdf_path=excluded.pdf_path,
-                decision=excluded.decision,
-                presentation=excluded.presentation,
-                rating=excluded.rating,
+                year=COALESCE(excluded.year, papers.year),
+                venue_id=COALESCE(excluded.venue_id, papers.venue_id),
+                forum=COALESCE(excluded.forum, papers.forum),
+                number=COALESCE(excluded.number, papers.number),
+                pdf_url=CASE
+                    WHEN excluded.pdf_url IS NOT NULL AND excluded.pdf_url <> '' THEN excluded.pdf_url
+                    ELSE papers.pdf_url
+                END,
+                pdf_path=CASE
+                    WHEN excluded.pdf_path IS NOT NULL AND excluded.pdf_path <> '' THEN excluded.pdf_path
+                    ELSE papers.pdf_path
+                END,
+                decision=CASE
+                    WHEN excluded.decision IS NOT NULL AND TRIM(excluded.decision) <> '' THEN excluded.decision
+                    ELSE papers.decision
+                END,
+                decision_text=CASE
+                    WHEN excluded.decision_text IS NOT NULL AND TRIM(excluded.decision_text) <> '' THEN excluded.decision_text
+                    ELSE papers.decision_text
+                END,
+                rebuttal_text=CASE
+                    WHEN excluded.rebuttal_text IS NOT NULL AND TRIM(excluded.rebuttal_text) <> '' THEN excluded.rebuttal_text
+                    ELSE papers.rebuttal_text
+                END,
+                presentation=COALESCE(excluded.presentation, papers.presentation),
+                rating=COALESCE(excluded.rating, papers.rating),
                 raw_json=excluded.raw_json,
                 updated_at=CURRENT_TIMESTAMP
             """,
             row,
         )
 
-        # reviews：简单策略，先删后插
-        cur.execute("DELETE FROM reviews WHERE paper_id = ?", (pid,))
-        reviews = p.get("reviews") or []
-        for idx, r in enumerate(reviews):
-            cur.execute(
-                """
-                INSERT INTO reviews (
-                    paper_id, idx, rating, rating_raw, confidence, confidence_raw,
-                    summary, strengths, weaknesses, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pid,
-                    idx,
-                    r.get("rating"),
-                    r.get("rating_raw"),
-                    r.get("confidence"),
-                    r.get("confidence_raw"),
-                    r.get("summary"),
-                    r.get("strengths"),
-                    r.get("weaknesses"),
-                    json.dumps(r, ensure_ascii=False),
-                ),
-            )
+        # reviews：默认“只增不删”（避免因权限/网络导致本次抓不到 reviews 就把历史 reviews 清空）
+        # 如需强制刷新为空，可设置 MUJICA_REPLACE_EMPTY_REVIEWS=1
+        replace_empty_reviews = (os.getenv("MUJICA_REPLACE_EMPTY_REVIEWS", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+
+        reviews = p.get("reviews")
+        if isinstance(reviews, list) and (reviews or replace_empty_reviews):
+            cur.execute("DELETE FROM reviews WHERE paper_id = ?", (pid,))
+            for idx, r in enumerate(reviews or []):
+                if not isinstance(r, dict):
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO reviews (
+                        paper_id, idx, rating, rating_raw, confidence, confidence_raw,
+                        summary, strengths, weaknesses, text, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pid,
+                        idx,
+                        r.get("rating"),
+                        r.get("rating_raw"),
+                        r.get("confidence"),
+                        r.get("confidence_raw"),
+                        r.get("summary"),
+                        r.get("strengths"),
+                        r.get("weaknesses"),
+                        r.get("text"),
+                        json.dumps(r, ensure_ascii=False),
+                    ),
+                )
 
         self._meta_conn.commit()
 
@@ -639,6 +900,57 @@ class KnowledgeBase:
             (paper_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def repair_pdf_paths(self, *, pdf_dir: str = "data/raw/pdfs") -> Dict[str, Any]:
+        """
+        修复历史数据中 pdf_path 被覆盖为空的问题：
+        - 扫描 pdf_dir 下的 <paper_id>.pdf
+        - 若 SQLite(papers.pdf_path) 为空且本地文件存在，则回填 pdf_path
+        """
+        if self._meta_conn is None:
+            raise RuntimeError("KnowledgeBase not initialized. Call initialize_db() first.")
+
+        pdf_dir = str(pdf_dir or "").strip() or "data/raw/pdfs"
+        updated = 0
+        scanned = 0
+
+        try:
+            rows = self._meta_conn.execute(
+                "SELECT id, pdf_path FROM papers WHERE pdf_path IS NULL OR TRIM(pdf_path) = ''"
+            ).fetchall()
+        except Exception:
+            rows = []
+
+        cur = self._meta_conn.cursor()
+        for r in rows or []:
+            try:
+                pid = str(r["id"])
+            except Exception:
+                pid = str(r[0]) if r and len(r) > 0 else ""
+            pid = pid.strip()
+            if not pid:
+                continue
+            scanned += 1
+            local_path = os.path.join(pdf_dir, f"{pid}.pdf")
+            if os.path.exists(local_path):
+                try:
+                    cur.execute("UPDATE papers SET pdf_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (local_path, pid))
+                    updated += 1
+                except Exception:
+                    pass
+
+        try:
+            self._meta_conn.commit()
+        except Exception:
+            pass
+
+        # 刷新 metadata_df（让 UI 立即看到）
+        try:
+            self.metadata_df = self._load_metadata_df()
+        except Exception:
+            pass
+
+        return {"ok": True, "scanned": scanned, "updated": updated, "pdf_dir": pdf_dir}
 
     def delete_paper(self, paper_id: str, *, delete_pdf: bool = False) -> Dict[str, Any]:
         """

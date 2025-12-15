@@ -17,19 +17,30 @@ class VerifierAgent:
     """
     事实核查（NLI/Entailment）：逐句对齐引用到的 evidence chunk。
 
-    期望引用格式：
-      [Paper ID: <paper_id> | Chunk: <chunk_id>]
+    支持的引用格式（兼容多种报告风格）：
+    1) Ref ID（推荐，对人友好）：[R1] / [R12][R3]
+    2) Chunk ID 简写（兼容旧 UI）：[paper_id::source::chunk_index]
+    3) 传统格式（旧 Writer）：[Paper ID: <paper_id> | Chunk: <chunk_id>]
     """
 
     _CIT_RE = re.compile(r"\[Paper ID:\s*([^\]|]+?)\s*\|\s*Chunk:\s*([^\]]+?)\]")
     _PAPER_ONLY_RE = re.compile(r"\[Paper ID:\s*([^\]]+?)\]")
+    _CHUNK_ONLY_RE = re.compile(r"\[([^\[\]\s]+::[^\[\]\s]+::\d+)\]")
+    _REF_RE = re.compile(r"\[(R\d+)\]")
+    _REF_SECTION_RE = re.compile(r"(?im)^\s*#{1,6}\s+(references|参考文献)\s*$")
 
     def __init__(self, llm_client, model: str = "gpt-4o"):
         self.llm = llm_client
         self.model = model
 
-    def _extract_claims(self, report_text: str) -> List[Dict[str, Any]]:
+    def _extract_claims(self, report_text: str, *, ref_map: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         text = (report_text or "").replace("\r\n", "\n")
+
+        # 忽略 References/参考文献 小节（避免把引用清单当成 claims 去核查）
+        m = self._REF_SECTION_RE.search(text)
+        if m:
+            text = text[: m.start()]
+
         lines = [l.strip() for l in text.split("\n") if l.strip()]
 
         claims: List[Dict[str, Any]] = []
@@ -37,16 +48,44 @@ class VerifierAgent:
             # 进一步按句号/问号/感叹号切分，降低“一个段落多个句子”带来的误配
             parts = re.split(r"(?<=[。！？.!?])\s+", line)
             for part in parts:
-                cits = self._CIT_RE.findall(part)
-                if not cits:
+                pair_cits = self._CIT_RE.findall(part)
+                ref_cits = self._REF_RE.findall(part)
+                chunk_cits = self._CHUNK_ONLY_RE.findall(part)
+
+                if (not pair_cits) and (not ref_cits) and (not chunk_cits):
                     continue
 
-                claim_text = self._CIT_RE.sub("", part).strip()
+                claim_text = part
+                claim_text = self._CIT_RE.sub("", claim_text)
+                claim_text = self._REF_RE.sub("", claim_text)
+                claim_text = self._CHUNK_ONLY_RE.sub("", claim_text)
+                claim_text = claim_text.strip()
                 claim_text = re.sub(r"\s+", " ", claim_text).strip()
                 if not claim_text:
                     continue
 
-                citations = [{"paper_id": p.strip(), "chunk_id": c.strip()} for p, c in cits]
+                citations: List[Dict[str, Any]] = []
+
+                # 传统格式：带 paper_id
+                for p, c in pair_cits:
+                    citations.append({"paper_id": p.strip(), "chunk_id": c.strip()})
+
+                # chunk_id-only：paper_id 从 chunk_id 前缀推断
+                for cid in chunk_cits:
+                    s = str(cid).strip()
+                    pid = s.split("::", 1)[0] if "::" in s else ""
+                    citations.append({"paper_id": pid, "chunk_id": s})
+
+                # Ref ID：映射到 chunk_id
+                for rid in ref_cits:
+                    if not ref_map or rid not in ref_map:
+                        # 交给上层统一报错（unknown ref）
+                        citations.append({"paper_id": "", "chunk_id": "", "ref": rid})
+                        continue
+                    cid = str(ref_map.get(rid) or "").strip()
+                    pid = cid.split("::", 1)[0] if "::" in cid else ""
+                    citations.append({"paper_id": pid, "chunk_id": cid, "ref": rid})
+
                 claims.append({"claim": claim_text, "raw": part, "citations": citations})
 
         return claims
@@ -59,15 +98,47 @@ class VerifierAgent:
         if not isinstance(chunk_map, dict):
             chunk_map = {}
 
-        claims = self._extract_claims(report_text)
+        # Ref ID map: R# -> chunk_id
+        ref_map = source_data.get("ref_map") if isinstance(source_data, dict) else None
+        if not isinstance(ref_map, dict):
+            ref_map = {}
+
+        # 如果报告引用了未知的 Ref ID，直接报错（否则后续会表现为“找不到 chunk”）
+        report_refs = set(self._REF_RE.findall(report_text or ""))
+        unknown_refs = sorted([r for r in report_refs if r not in ref_map])
+        if unknown_refs:
+            return {
+                "is_valid": False,
+                "score": 0.0,
+                "notes": f"发现未知引用标记（Ref ID 不在本次证据集中）：{', '.join(unknown_refs[:20])}",
+                "unknown_refs": unknown_refs[:50],
+            }
+
+        claims = self._extract_claims(report_text, ref_map=ref_map)
         if not claims:
             # fallback：兼容旧格式，仅检查是否存在 [Paper ID: ...]
             citations = self._PAPER_ONLY_RE.findall(report_text or "")
-            if not citations:
+            chunk_only = self._CHUNK_ONLY_RE.findall(report_text or "")
+            refs = self._REF_RE.findall(report_text or "")
+            if (not citations) and (not chunk_only) and (not refs):
                 return {
                     "is_valid": False,
                     "score": 0.0,
-                    "notes": "未发现任何引用。报告必须将结论锚定到来源。",
+                    "notes": "未发现任何引用。请在结论句末尾加入引用（支持 [R1] / [paper_id::source::idx] / [Paper ID: ... | Chunk: ...]）。",
+                }
+            if refs:
+                return {
+                    "is_valid": True,
+                    "score": 0.5,
+                    "notes": "检测到引用标记（Ref ID），但未能抽取可核查的句级 claims；跳过逐句 NLI。",
+                    "stats": {"unique_refs": len(set([c.strip() for c in refs]))},
+                }
+            if chunk_only:
+                return {
+                    "is_valid": True,
+                    "score": 0.5,
+                    "notes": "检测到 chunk-level 引用（chunk_id-only），但未能抽取可核查的句级 claims；跳过逐句 NLI。",
+                    "stats": {"unique_chunk_citations": len(set([c.strip() for c in chunk_only]))},
                 }
             return {
                 "is_valid": True,

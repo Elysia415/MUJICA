@@ -35,13 +35,34 @@ class OpenReviewIngestor:
         limit: Optional[int] = None,
         accepted_only: bool = False,
         presentation_in: Optional[List[str]] = None,
+        skip_existing: bool = False,
+        skip_paper_ids: Optional[set[str]] = None,
         download_pdfs: bool = True,
         parse_pdfs: bool = True,
         max_pdf_pages: Optional[int] = 12,
         max_downloads: Optional[int] = None,
         on_progress: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
-        papers = self.fetcher.fetch_papers(venue_id, limit=limit, accepted_only=accepted_only)
+        # “追加抓取”模式：跳过已存在的论文 ID，直到凑够 limit 个新论文（或扫完）
+        skip_ids = None
+        if skip_existing:
+            if isinstance(skip_paper_ids, set) and skip_paper_ids:
+                skip_ids = skip_paper_ids
+            else:
+                try:
+                    df = self.kb.search_structured()
+                    if hasattr(df, "__len__") and (not df.empty) and ("id" in df.columns):  # type: ignore[attr-defined]
+                        skip_ids = set([str(x) for x in df["id"].tolist() if str(x).strip()])
+                except Exception:
+                    skip_ids = None
+
+        papers = self.fetcher.fetch_papers(
+            venue_id,
+            limit=limit,
+            accepted_only=accepted_only,
+            skip_paper_ids=skip_ids,
+            on_progress=on_progress,
+        )
 
         # 双重兜底：某些会议 decision 字段可能缺失/格式不同，这里再做一次过滤保证语义
         if accepted_only:
@@ -91,7 +112,7 @@ class OpenReviewIngestor:
                 if pdf_path and os.path.exists(pdf_path):
                     p["content"] = self.parser.parse_pdf(pdf_path, max_pages=max_pdf_pages)
 
-        self.kb.ingest_data(papers)
+        self.kb.ingest_data(papers, on_progress=on_progress)
         return papers
 
 
