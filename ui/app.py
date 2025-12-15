@@ -86,34 +86,55 @@ def _apply_theme_vars(theme: str) -> None:
     theme = (theme or "").strip().lower()
     if theme in {"dark", "深色"}:
         vars_css = """
-            /* Dark theme (inspired by “深黑 + 酒红高光”视觉) */
-            --bg: #07060b;
-            --bg-glow-1: rgba(185, 0, 60, 0.34);
-            --bg-glow-2: rgba(255, 45, 85, 0.14);
+            /* Ave Mujica Theme (Dark/Gothic/Elegant) */
+            /* Background: Deep Abyss Black */
+            --bg: #050505;
+            
+            /* Background Glows: Blood Red & Phantom Purple */
+            --bg-glow-1: rgba(139, 0, 50, 0.35); 
+            --bg-glow-2: rgba(75, 0, 130, 0.25); 
 
-            /* 提高面板对比度（避免“糊成一片”） */
-            --panel: rgba(20, 18, 28, 0.96);
-            --panel-2: rgba(28, 24, 40, 0.90);
+            /* Panels: Dark tempered glass (more transparent) */
+            --panel: rgba(18, 18, 24, 0.70);
+            --panel-2: rgba(26, 26, 32, 0.65);
 
-            --text: #ffffff;
-            --muted: rgba(255, 255, 255, 0.78);
+            /* Text: Silver/White for contrast against dark bg */
+            --text: #eaeaea;
+            --muted: #999999;
 
-            --border: rgba(255, 255, 255, 0.22);
-            --shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+            /* Borders: Bright Antique Gold (popping against glass) */
+            --border: rgba(197, 160, 89, 0.6); 
+            
+            /* Shadows: Heavy and dark for depth */
+            --shadow: 0 20px 50px rgba(0, 0, 0, 0.85);
 
-            --sidebar-bg: rgba(10, 9, 14, 0.96);
-            /* 输入框底色再抬高一档，保证可读性 */
-            --input-bg: rgba(255, 255, 255, 0.07);
-            --code-bg: rgba(0, 0, 0, 0.28);
+            --sidebar-bg: rgba(10, 10, 12, 0.85);
+            
+            /* Inputs: More transparent glass */
+            --input-bg: rgba(0, 0, 0, 0.35);
+            --code-bg: rgba(0, 0, 0, 0.4);
 
-            --accent: #ff2d55;
-            --accent-2: #b3003a;
-            --accent-hover: #ff4d6d;
-            --accent-2-hover: #d10046;
-            --accent-shadow: rgba(255, 45, 85, 0.22);
-            --accent-shadow-hover: rgba(255, 45, 85, 0.30);
-            --accent-focus: rgba(255, 45, 85, 0.60);
-            --accent-focus-shadow: rgba(255, 45, 85, 0.18);
+            /* Accents: Crimson Red & Gold */
+            --accent: #8a002b;      /* Deep Crimson */
+            --accent-2: #c5a059;    /* Antique Gold */
+            
+            --accent-hover: #a30033;
+            --accent-2-hover: #d4af37;
+            
+            --accent-shadow: rgba(139, 0, 50, 0.5);
+            --accent-shadow-hover: rgba(212, 175, 55, 0.3);
+            
+            --accent-focus: rgba(197, 160, 89, 0.6);
+            --accent-focus-shadow: rgba(139, 0, 50, 0.2);
+
+            /* Button Specifics (Dark Mode) */
+            --btn-primary-bg: linear-gradient(145deg, #8a002b 0%, #4a0016 100%);
+            --btn-primary-text: #ffffff;
+            --btn-primary-border: rgba(197, 160, 89, 0.6);
+
+            --btn-secondary-bg: rgba(255, 255, 255, 0.05);
+            --btn-secondary-text: #eaeaea;
+            --btn-secondary-border: rgba(197, 160, 89, 0.4);
         """
     else:
         # 默认：浅色粉系（参考截图风格）
@@ -138,6 +159,15 @@ def _apply_theme_vars(theme: str) -> None:
             --sidebar-bg: rgba(255, 255, 255, 0.92);
             --input-bg: rgba(255, 255, 255, 0.98);
             --code-bg: rgba(17, 24, 39, 0.04);
+
+            /* Button Specifics (Light Mode - Simple) */
+            --btn-primary-bg: linear-gradient(135deg, #ff5c93 0%, #ff3b82 100%);
+            --btn-primary-text: #ffffff;
+            --btn-primary-border: rgba(17, 24, 39, 0.12);
+
+            --btn-secondary-bg: #ffffff;
+            --btn-secondary-text: #111827;
+            --btn-secondary-border: rgba(17, 24, 39, 0.12);
         """
 
     st.markdown(f"<style>:root{{{vars_css}}}</style>", unsafe_allow_html=True)

@@ -3,14 +3,15 @@
 /* Layout paddings */
 [data-testid="stMainBlockContainer"] {
     padding-top: 2.0rem;
-    padding-bottom: 5.0rem; /* 给底部 chat_input 留空间 */
+    padding-bottom: 5.0rem;
+    /* 给底部 chat_input 留空间 */
 }
 
 /* App background */
 [data-testid="stAppViewContainer"] {
-    background: radial-gradient(980px 560px at 50% -10%, var(--bg-glow-1), transparent 62%),
-                radial-gradient(980px 580px at 15% 10%, var(--bg-glow-2), transparent 58%),
-                var(--bg);
+    background: radial-gradient(circle at 60% -20%, var(--bg-glow-1), transparent 50%),
+        radial-gradient(circle at 10% 40%, var(--bg-glow-2), transparent 45%),
+        var(--bg);
     color: var(--text);
 }
 
@@ -21,9 +22,16 @@
 }
 
 /* Typography */
-h1, h2, h3, h4, h5, h6 {
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
     color: var(--text) !important;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", Arial, sans-serif;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+    /* Make headers pop */
 }
 
 /* 关键：Streamlit 的 widget label/正文有时会被内联样式覆盖，导致暗色看不清。
@@ -49,12 +57,14 @@ li {
     text-align: center;
     margin: 1.0rem auto 0.25rem auto;
 }
+
 .mujica-hero-title {
     font-size: 2.1rem;
     line-height: 1.15;
     font-weight: 800;
     letter-spacing: -0.02em;
 }
+
 .mujica-hero-subtitle {
     margin-top: 0.5rem;
     color: var(--muted);
@@ -67,36 +77,78 @@ a {
 }
 
 /* Muted text */
-[data-testid="stCaptionContainer"], .stCaption, small {
+[data-testid="stCaptionContainer"],
+.stCaption,
+small {
     color: var(--muted) !important;
 }
 
 /* Buttons */
-.stButton > button {
-    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
-    color: #ffffff;
-    border: 1px solid var(--border);
-    border-radius: 14px;
+/* Buttons - Universal Reset & Base Styles */
+.stButton>button,
+.stFormSubmitButton>button {
+    border-radius: 6px;
     font-weight: 600;
-    transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
-    box-shadow: 0 12px 26px var(--accent-shadow);
+    transition: all 0.2s ease;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    position: relative;
+    overflow: hidden;
+    /* Default to Primary var if specific selector fails (Safe fallback) */
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-text);
+    border: 1px solid var(--btn-primary-border);
+    box-shadow: 0 0 15px var(--accent-shadow);
 }
-.stButton > button:hover {
-    background: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent-2-hover) 100%);
-    transform: translateY(-1px);
-    box-shadow: 0 16px 30px var(--accent-shadow-hover);
+
+/* Specific Target for Primary Buttons */
+.stButton>button[data-testid="baseButton-primary"],
+.stFormSubmitButton>button[data-testid="baseButton-primary"] {
+    background: var(--btn-primary-bg) !important;
+    color: var(--btn-primary-text) !important;
+    border: 1px solid var(--btn-primary-border) !important;
+}
+
+/* Specific Target for Secondary Buttons */
+.stButton>button[data-testid="baseButton-secondary"],
+.stFormSubmitButton>button[data-testid="baseButton-secondary"] {
+    background: var(--btn-secondary-bg) !important;
+    color: var(--btn-secondary-text) !important;
+    border: 1px solid var(--btn-secondary-border) !important;
+    box-shadow: none !important;
+    /* Secondary usually has no glow by default */
+}
+
+/* Hover States */
+.stButton>button:hover,
+.stFormSubmitButton>button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 0 25px var(--accent-shadow-hover), inset 0 0 10px rgba(255, 255, 255, 0.2);
+}
+
+/* Specific Hover for Secondary */
+.stButton>button[data-testid="baseButton-secondary"]:hover,
+.stFormSubmitButton>button[data-testid="baseButton-secondary"]:hover {
+    border-color: var(--accent-2) !important;
+    /* Gold hover border for secondary */
+    color: var(--text) !important;
+    /* Optional: Slight fill on hover for glass buttons */
+    background: linear-gradient(145deg, rgba(138, 0, 43, 0.2) 0%, rgba(74, 0, 22, 0.2) 100%) !important;
 }
 
 /* Inputs */
 .stTextInput input,
 .stTextArea textarea,
 .stNumberInput input,
-.stSelectbox div[data-baseweb="select"] > div {
+.stSelectbox div[data-baseweb="select"]>div {
     background-color: var(--input-bg) !important;
     color: var(--text) !important;
     border: 1px solid var(--border) !important;
-    border-radius: 14px !important;
+    border-radius: 8px !important;
+    backdrop-filter: blur(12px);
+    /* Stronger glass blur */
 }
+
 .stTextInput input::placeholder,
 .stTextArea textarea::placeholder {
     color: var(--muted) !important;
@@ -106,29 +158,35 @@ a {
 .stTextArea textarea:focus,
 [data-testid="stChatInput"] textarea:focus {
     outline: none !important;
-    border-color: var(--accent-focus) !important;
-    box-shadow: 0 0 0 4px var(--accent-focus-shadow) !important;
+    border-color: var(--accent-2) !important;
+    /* Gold border on focus */
+    box-shadow: 0 0 12px var(--accent-focus) !important;
+    /* Gold glow */
 }
 
 /* Chat bubbles */
 [data-testid="stChatMessage"] {
     background: var(--panel-2);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(8px);
 }
 
 /* Card style (Streamlit 1.26 compatible)
    - st.container(border=True) 在 1.26 不支持
    - 我们用 st.form 作为“卡片容器”，这里把 stForm 样式化成卡片
 */
+/* Card style */
 div[data-testid="stForm"] {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 18px;
+    border-radius: 12px;
     box-shadow: var(--shadow);
-    padding: 1.0rem 1.0rem 0.75rem 1.0rem;
-    backdrop-filter: blur(10px);
+    padding: 1.5rem;
+    /* More airy */
+    backdrop-filter: blur(16px);
+    /* Strong glass card */
 }
 
 /* Chat input */
@@ -138,6 +196,7 @@ div[data-testid="stForm"] {
     border: 1px solid var(--border) !important;
     border-radius: 14px !important;
 }
+
 [data-testid="stChatInput"] textarea::placeholder {
     color: var(--muted) !important;
 }
@@ -157,6 +216,7 @@ div[data-testid="stForm"] {
     border-radius: 14px !important;
     box-shadow: var(--shadow);
 }
+
 [data-testid="stAlert"] * {
     color: var(--text) !important;
 }
