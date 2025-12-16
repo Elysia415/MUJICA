@@ -21,6 +21,7 @@ pip-delete-this-directory.txt
 data/raw/
 data/processed/
 data/lancedb/
+data/ui_history/
 
 # IDE settings
 .vscode/

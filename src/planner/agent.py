@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from src.utils.cancel import MujicaCancelled, check_cancel
 from src.utils.json_utils import extract_json_object
 
 
@@ -17,11 +18,18 @@ class PlannerAgent:
         self.llm = llm_client
         self.model = model
 
-    def generate_plan(self, user_query: str, db_stats: Dict) -> Dict:
+    def generate_plan(
+        self,
+        user_query: str,
+        db_stats: Dict,
+        *,
+        cancel_event: Optional[Any] = None,
+    ) -> Dict:
         """
         Generates a research plan/outline based on user query and DB stats using LLM.
         """
         print(f"Planning research for: {user_query} using {self.model}")
+        check_cancel(cancel_event, stage="planner_start")
         
         system_prompt = """
 你是 MUJICA 的 Planner（中文输出）。你的任务是：根据用户主题与数据库统计信息，生成一个研究计划（JSON）。
@@ -74,11 +82,13 @@ JSON 示例结构（仅结构示意，不要照抄内容）：
             # 可通过 MUJICA_DISABLE_JSON_MODE=1 强制关闭（例如 GLM 等）
             if not _env_truthy("MUJICA_DISABLE_JSON_MODE"):
                 try:
+                    check_cancel(cancel_event, stage="planner_llm_json_before")
                     response = self.llm.chat.completions.create(
                         model=self.model,
                         messages=messages,
                         response_format={"type": "json_object"},
                     )
+                    check_cancel(cancel_event, stage="planner_llm_json_after")
                     content = response.choices[0].message.content or ""
                     plan = json.loads(content)
                     if isinstance(plan, dict) and plan.get("sections"):
@@ -87,16 +97,20 @@ JSON 示例结构（仅结构示意，不要照抄内容）：
                     print(f"Planner json_mode failed: {e} (fallback to plain JSON)")
 
             # fallback：不用 response_format，让模型按提示输出 JSON，再做提取/解析
+            check_cancel(cancel_event, stage="planner_llm_plain_before")
             response = self.llm.chat.completions.create(
                 model=self.model,
                 messages=messages,
             )
+            check_cancel(cancel_event, stage="planner_llm_plain_after")
             content = response.choices[0].message.content or ""
             plan = extract_json_object(content)
             if isinstance(plan, dict) and plan.get("sections"):
                 return plan
 
             raise ValueError("Planner returned invalid plan JSON.")
+        except MujicaCancelled:
+            raise
         except Exception as e:
             print(f"Error generating plan: {e}")
             # Fallback mock plan

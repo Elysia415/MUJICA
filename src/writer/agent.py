@@ -5,7 +5,9 @@ import os
 import re
 import time
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+
+from src.utils.cancel import MujicaCancelled, check_cancel
 
 
 class WriterAgent:
@@ -125,6 +127,7 @@ class WriterAgent:
         research_notes: List[Dict[str, Any]],
         *,
         on_progress: Any = None,
+        cancel_event: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         循证写作：严格基于 research_notes.evidence 生成 Markdown 报告。
@@ -132,6 +135,7 @@ class WriterAgent:
         - 参考文献（References）由系统自动补全：标题 + 来源类型 + 片段 + snippet
         """
         print("Writing final report...")
+        check_cancel(cancel_event, stage="write_start")
 
         title = plan.get("title", "Research Report")
 
@@ -144,6 +148,7 @@ class WriterAgent:
 
         t_all = time.time()
         _emit("write_start", title=title)
+        check_cancel(cancel_event, stage="write_build_refs")
         ref_ctx = self._build_ref_catalog(research_notes)
         ref_items = ref_ctx.get("ref_items") or []
         chunk_to_ref = ref_ctx.get("chunk_to_ref") or {}
@@ -152,6 +157,7 @@ class WriterAgent:
         sections_payload = []
         evidence_total = 0
         for note in research_notes:
+            check_cancel(cancel_event, stage="write_build_payload")
             evidence = note.get("evidence") or []
             evidence_total += len(evidence)
 
@@ -207,6 +213,7 @@ class WriterAgent:
             evidence_snippets=evidence_total,
             allowed_refs_total=len(ref_items),
         )
+        check_cancel(cancel_event, stage="write_before_llm")
 
         system_prompt = """
 你是 MUJICA 的 Writer（循证写作，中文输出）。
@@ -265,6 +272,7 @@ Sections (JSON):
                 **llm_kwargs,
             )
             dt_llm = time.time() - t_llm
+            check_cancel(cancel_event, stage="write_after_llm")
 
             # token usage（部分 OpenAI-compatible provider 可能不返回 usage）
             usage = getattr(response, "usage", None)
@@ -340,6 +348,8 @@ Sections (JSON):
                 total_tokens=writer_stats["total_tokens"],
             )
             return final, ref_ctx
+        except MujicaCancelled:
+            raise
         except Exception as e:
             print(f"Error writing report: {e}")
             try:

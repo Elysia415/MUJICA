@@ -5,6 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.utils.cancel import MujicaCancelled, check_cancel
 from src.utils.json_utils import extract_json_object
 
 
@@ -90,8 +91,15 @@ class VerifierAgent:
 
         return claims
 
-    def verify_report(self, report_text: str, source_data: Dict[str, Any]) -> Dict[str, Any]:
+    def verify_report(
+        self,
+        report_text: str,
+        source_data: Dict[str, Any],
+        *,
+        cancel_event: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         print("Verifying report integrity...")
+        check_cancel(cancel_event, stage="verify_start")
 
         # evidence index: chunk_id -> text
         chunk_map = source_data.get("chunks") if isinstance(source_data, dict) else None
@@ -190,6 +198,7 @@ class VerifierAgent:
         )
 
         for item in claims[:max_claims]:
+            check_cancel(cancel_event, stage="verify_claim")
             claim = item["claim"]
             cited_chunks = item["citations"]
 
@@ -239,6 +248,9 @@ Evidence:
                         messages=messages,
                     )
                     parsed = extract_json_object(resp.choices[0].message.content or "")
+                check_cancel(cancel_event, stage="verify_after_llm")
+            except MujicaCancelled:
+                raise
             except Exception as e:
                 parsed = {"label": "unknown", "score": 0.0, "reason": f"verification_error: {e}"}
 

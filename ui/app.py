@@ -4,8 +4,13 @@ import inspect
 import json
 import os
 import sys
+import threading
+import time
+import traceback
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
@@ -24,6 +29,15 @@ from src.planner.agent import PlannerAgent
 from src.researcher.agent import ResearcherAgent
 from src.writer.agent import WriterAgent
 from src.verifier.agent import VerifierAgent
+from src.utils.cancel import MujicaCancelled
+from src.utils.chat_history import (
+    delete_conversation,
+    list_conversations,
+    load_conversation,
+    new_conversation_id,
+    rename_conversation,
+    save_conversation,
+)
 
 
 def _ensure_streamlit_context() -> bool:
@@ -77,6 +91,441 @@ def _width_kwargs(fn, *, stretch: bool = True) -> dict:
     # 兜底：旧版大概率支持 use_container_width
     return {"use_container_width": bool(stretch)}
 
+
+def _get_query_params() -> dict:
+    # Streamlit 版本兼容（1.26: experimental_get_query_params；新版: st.query_params）
+    try:
+        if hasattr(st, "query_params"):
+            qp = st.query_params  # type: ignore[attr-defined]
+            out = {}
+            for k in qp.keys():
+                try:
+                    out[k] = qp.get_all(k)  # type: ignore[attr-defined]
+                except Exception:
+                    v = qp.get(k)  # type: ignore[attr-defined]
+                    out[k] = v if isinstance(v, list) else [v] if v is not None else []
+            return out
+        if hasattr(st, "experimental_get_query_params"):
+            return st.experimental_get_query_params()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return {}
+
+
+def _set_query_params(**kwargs) -> None:
+    # kwargs: key -> str
+    try:
+        if hasattr(st, "query_params"):
+            qp = st.query_params  # type: ignore[attr-defined]
+            qp.clear()  # type: ignore[attr-defined]
+            for k, v in kwargs.items():
+                if v is None:
+                    continue
+                qp[str(k)] = str(v)  # type: ignore[attr-defined]
+            return
+        if hasattr(st, "experimental_set_query_params"):
+            st.experimental_set_query_params(**{k: v for k, v in kwargs.items() if v is not None})  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+
+def _reset_workspace_state(*, cancel_running_job: bool = True) -> None:
+    # 可选：离开时尝试停止后台任务
+    if cancel_running_job:
+        job = st.session_state.get("research_job")
+        try:
+            if isinstance(job, _ResearchJob) and job.status == "running":
+                job.cancel_event.set()
+        except Exception:
+            pass
+        pj = st.session_state.get("plan_job")
+        try:
+            if isinstance(pj, _PlanJob) and pj.status == "running":
+                pj.cancel_event.set()
+        except Exception:
+            pass
+
+    st.session_state["messages"] = []
+    st.session_state["research_notes"] = []
+    st.session_state["final_report"] = ""
+    st.session_state["report_ref_ctx"] = None
+    st.session_state["writer_stats"] = None
+    st.session_state["pending_plan"] = None
+    st.session_state["plan_editor_text"] = ""
+    st.session_state["plan_approved"] = False
+    st.session_state["verification_result"] = None
+    # 当前对话标题（用于历史保存；避免把旧标题写入新对话）
+    st.session_state["conversation_title"] = ""
+    st.session_state.pop("pending_user_query", None)
+    st.session_state.pop("plan_run_requested", None)
+
+
+def _history_snapshot() -> Dict[str, Any]:
+    """
+    对话历史快照（脱敏！绝不保存 API Key/Access Code）。
+    """
+    return {
+        "created_ts": float(st.session_state.get("history_created_ts") or time.time()),
+        # 若用户手动重命名，这里必须带上 title，否则自动保存会被“首条用户消息”重置标题
+        "title": str(st.session_state.get("conversation_title") or "").strip() or None,
+        "messages": list(st.session_state.get("messages") or []),
+        "pending_plan": st.session_state.get("pending_plan"),
+        "plan_editor_text": str(st.session_state.get("plan_editor_text") or ""),
+        "plan_approved": bool(st.session_state.get("plan_approved")),
+        "research_notes": st.session_state.get("research_notes") or [],
+        "final_report": str(st.session_state.get("final_report") or ""),
+        "verification_result": st.session_state.get("verification_result"),
+        "writer_stats": st.session_state.get("writer_stats"),
+        "report_ref_ctx": st.session_state.get("report_ref_ctx"),
+        "system_mode": str(st.session_state.get("system_mode") or "research"),
+        "ui_theme": str(st.session_state.get("ui_theme") or "light"),
+    }
+
+
+# ---------------------------
+# 后台研究任务（支持停止）
+# ---------------------------
+
+
+@dataclass
+class _ResearchJob:
+    job_id: str
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    status: str = "running"  # running|done|cancelled|error
+    stage: str = "init"
+    message: str = ""
+    progress: Dict[str, Any] = field(default_factory=dict)
+    result: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    error_trace: Optional[str] = None
+    started_ts: float = field(default_factory=lambda: time.time())
+    finished_ts: Optional[float] = None
+    thread: Optional[threading.Thread] = None
+
+
+def _job_update(job: Any, **kwargs: Any) -> None:
+    with job.lock:
+        for k, v in kwargs.items():
+            setattr(job, k, v)
+        # 轻量记录最后一次变更时间（用于 UI 展示）
+        job.progress["_ts"] = time.time()
+
+
+def _job_emit_progress(job: Any, *, kind: str, payload: Dict[str, Any]) -> None:
+    """
+    线程安全地写入进度信息（注意：不要在 worker 线程里调用任何 st.*）。
+    """
+    with job.lock:
+        job.progress[kind] = payload
+        job.progress["_ts"] = time.time()
+
+
+@dataclass
+class _PlanJob:
+    job_id: str
+    query: str
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    status: str = "running"  # running|done|cancelled|error
+    stage: str = "init"
+    message: str = ""
+    progress: Dict[str, Any] = field(default_factory=dict)
+    result: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    error_trace: Optional[str] = None
+    started_ts: float = field(default_factory=lambda: time.time())
+    finished_ts: Optional[float] = None
+    thread: Optional[threading.Thread] = None
+
+
+def _run_plan_job(
+    job: _PlanJob,
+    *,
+    user_query: str,
+    stats: Dict[str, Any],
+    chat_api_key: Optional[str],
+    chat_base_url: Optional[str],
+    model_name: str,
+) -> None:
+    """
+    后台线程入口：Plan（生成研究计划）。
+    注意：该函数运行在后台线程中，严禁调用 Streamlit API（st.*）。
+    """
+    try:
+        _job_update(job, status="running", stage="init", message="初始化规划（连接模型）...")
+        llm = get_llm_client(api_key=chat_api_key, base_url=chat_base_url, allow_env_fallback=False)
+        if llm is None:
+            raise RuntimeError("Authentication Failed: missing/invalid API key.")
+
+        planner = PlannerAgent(llm, model=model_name)
+        _job_update(job, stage="planning", message="生成研究计划（Plan）...")
+        plan = planner.generate_plan(user_query, stats, cancel_event=job.cancel_event)
+        _job_update(job, result={"plan": plan}, status="done", stage="done", message="规划完成 ✅", finished_ts=time.time())
+    except MujicaCancelled as e:
+        _job_update(job, status="cancelled", stage="cancelled", message="已停止规划", error=str(e), finished_ts=time.time())
+    except Exception as e:
+        _job_update(
+            job,
+            status="error",
+            stage="error",
+            message="规划失败 ❌",
+            error=str(e),
+            error_trace=traceback.format_exc(),
+            finished_ts=time.time(),
+        )
+
+
+def _run_research_job(
+    job: _ResearchJob,
+    *,
+    plan: Dict[str, Any],
+    chat_api_key: Optional[str],
+    chat_base_url: Optional[str],
+    model_name: str,
+    embedding_model: str,
+    embedding_api_key: Optional[str],
+    embedding_base_url: Optional[str],
+) -> None:
+    """
+    后台线程入口：Research -> Write -> Verify。
+
+    约束：该函数运行在后台线程中，严禁调用 Streamlit API（st.*）。
+    """
+    try:
+        _job_update(job, status="running", stage="init", message="初始化（连接知识库/模型）...")
+
+        # 每个 job 自己创建 KB/连接，避免与 UI 线程共享连接对象
+        kb = KnowledgeBase(
+            embedding_model=embedding_model,
+            embedding_api_key=embedding_api_key,
+            embedding_base_url=embedding_base_url,
+        )
+        kb.initialize_db()
+
+        llm = get_llm_client(
+            api_key=chat_api_key,
+            base_url=chat_base_url,
+            allow_env_fallback=False,  # 门禁：禁止偷读 env
+        )
+        if llm is None:
+            raise RuntimeError("Authentication Failed: missing/invalid API key.")
+
+        researcher = ResearcherAgent(kb, llm, model=model_name)
+        writer = WriterAgent(llm, model=model_name)
+        verifier = VerifierAgent(llm, model=model_name)
+
+        # ---------- Research ----------
+        _job_update(job, stage="research", message="检索证据（Research）...")
+
+        def _on_research_progress(payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            _job_emit_progress(job, kind="research", payload=payload)
+            # 让 UI 能看到更友好的当前阶段描述
+            stg = payload.get("stage")
+            if stg == "research_section":
+                sec = payload.get("section") or ""
+                q = payload.get("query") or ""
+                _job_update(job, stage="research", message=f"检索中：{sec}（{q}）")
+            elif stg == "research_section_done":
+                sec = payload.get("section") or ""
+                _job_update(job, stage="research", message=f"已完成章节：{sec}")
+
+        notes = researcher.execute_research(plan, on_progress=_on_research_progress, cancel_event=job.cancel_event)
+        _job_update(job, result={**job.result, "research_notes": notes})
+
+        # ---------- Write ----------
+        _job_update(job, stage="write", message="循证写作（Write）...")
+
+        def _on_write_progress(payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            _job_emit_progress(job, kind="write", payload=payload)
+            stg = payload.get("stage")
+            if stg == "write_refs_built":
+                _job_update(job, stage="write", message=f"写作准备：refs={payload.get('refs_total')}")
+            elif stg == "write_payload_built":
+                _job_update(
+                    job,
+                    stage="write",
+                    message=(
+                        f"写作准备：sections={payload.get('sections')} · evidence={payload.get('evidence_snippets')} · refs={payload.get('allowed_refs_total')}"
+                    ),
+                )
+            elif stg == "write_llm_call":
+                _job_update(job, stage="write", message=f"LLM 生成中：model={payload.get('model')}")
+            elif stg == "write_done":
+                _job_update(job, stage="write", message="写作完成。")
+            elif stg == "write_error":
+                _job_update(job, stage="write", message=f"写作失败：{payload.get('error')}")
+
+        report, ref_ctx = writer.write_report(
+            plan,
+            notes,
+            on_progress=_on_write_progress,
+            cancel_event=job.cancel_event,
+        )
+
+        writer_stats = None
+        try:
+            writer_stats = (ref_ctx or {}).get("writer_stats")
+        except Exception:
+            writer_stats = None
+
+        _job_update(
+            job,
+            result={
+                **job.result,
+                "final_report": report,
+                "report_ref_ctx": ref_ctx,
+                "writer_stats": writer_stats,
+            },
+        )
+
+        # ---------- Verify ----------
+        _job_update(job, stage="verify", message="逐句核查（Verify）...")
+
+        chunk_map: Dict[str, str] = {}
+        for n in notes:
+            for e in (n.get("evidence") or []):
+                cid = e.get("chunk_id")
+                txt = e.get("text")
+                if cid and txt and cid not in chunk_map:
+                    chunk_map[cid] = txt
+
+        ref_map: Dict[str, Any] = {}
+        try:
+            ref_map = (ref_ctx or {}).get("ref_map") or {}
+        except Exception:
+            ref_map = {}
+
+        verification = verifier.verify_report(
+            report,
+            {"chunks": chunk_map, "ref_map": ref_map},
+            cancel_event=job.cancel_event,
+        )
+        _job_update(job, result={**job.result, "verification_result": verification})
+
+        _job_update(job, status="done", stage="done", message="完成 ✅", finished_ts=time.time())
+    except MujicaCancelled as e:
+        _job_update(job, status="cancelled", stage="cancelled", message="已停止（取消成功）", error=str(e), finished_ts=time.time())
+    except Exception as e:
+        _job_update(
+            job,
+            status="error",
+            stage="error",
+            message="运行失败 ❌",
+            error=str(e),
+            error_trace=traceback.format_exc(),
+            finished_ts=time.time(),
+        )
+
+
+# ---------------------------
+# 后台入库任务（支持停止 + UI 不中断）
+# ---------------------------
+
+@dataclass
+class _IngestJob:
+    """数据入库后台任务（下载/解析/Embedding）"""
+    job_id: str
+    venue_id: str
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    status: str = "running"  # running|done|cancelled|error
+    stage: str = "init"
+    message: str = ""
+    progress: Dict[str, Any] = field(default_factory=dict)
+    result: List[Dict[str, Any]] = field(default_factory=list)  # papers list
+    error: Optional[str] = None
+    error_trace: Optional[str] = None
+    started_ts: float = field(default_factory=lambda: time.time())
+    finished_ts: Optional[float] = None
+    thread: Optional[threading.Thread] = None
+
+
+def _run_ingest_job(
+    job: _IngestJob,
+    *,
+    ingestor: Any,
+    venue_id: str,
+    limit: Optional[int],
+    accepted_only: bool,
+    presentation_in: Optional[List[str]],
+    skip_existing: bool,
+    download_pdfs: bool,
+    parse_pdfs: bool,
+    max_pdf_pages: Optional[int],
+    max_downloads: Optional[int],
+) -> None:
+    """
+    后台线程入口：数据入库（Fetch -> Download -> Parse -> Embed）。
+    注意：该函数运行在后台线程中，严禁调用 Streamlit API（st.*）。
+    """
+    try:
+        _job_update(job, stage="ingest", message="正在入库...")
+
+        def _on_progress(payload: Dict[str, Any]) -> None:
+            # 不调用 st.* 只更新 job.progress
+            if job.cancel_event.is_set():
+                # 抛出异常中止 ingestor（如果支持的话）
+                raise MujicaCancelled("用户取消")
+            if isinstance(payload, dict):
+                stage = payload.get("stage", "unknown")
+                _job_emit_progress(job, kind=stage, payload=payload)
+                # 也更新 message 方便 UI 显示
+                cur = payload.get("current", 0)
+                tot = payload.get("total", 0)
+                if stage == "fetch_papers":
+                    _job_update(job, message=f"抓取元数据 {cur}/{tot}")
+                elif stage == "download_pdf":
+                    _job_update(job, message=f"下载 PDF {cur}/{tot}")
+                elif stage == "parse_pdf":
+                    _job_update(job, message=f"解析 PDF {cur}/{tot}")
+                elif stage in {"embed_papers", "embed_chunks"}:
+                    _job_update(job, message=f"Embedding {cur}/{tot}")
+
+        papers = ingestor.ingest_venue(
+            venue_id=venue_id,
+            limit=limit,
+            accepted_only=accepted_only,
+            presentation_in=presentation_in,
+            skip_existing=skip_existing,
+            download_pdfs=download_pdfs,
+            parse_pdfs=parse_pdfs,
+            max_pdf_pages=max_pdf_pages,
+            max_downloads=max_downloads,
+            on_progress=_on_progress,
+        )
+
+        _job_update(
+            job,
+            status="done",
+            stage="done",
+            message=f"入库完成 ✅ 共 {len(papers)} 篇论文",
+            result=papers,
+            finished_ts=time.time(),
+        )
+
+    except MujicaCancelled:
+        _job_update(
+            job,
+            status="cancelled",
+            stage="cancelled",
+            message="已取消",
+            finished_ts=time.time(),
+        )
+    except Exception as e:
+        _job_update(
+            job,
+            status="error",
+            stage="error",
+            message="入库失败 ❌",
+            error=str(e),
+            error_trace=traceback.format_exc(),
+            finished_ts=time.time(),
+        )
 
 def _apply_theme_vars(theme: str) -> None:
     """
@@ -135,39 +584,72 @@ def _apply_theme_vars(theme: str) -> None:
             --btn-secondary-bg: rgba(255, 255, 255, 0.05);
             --btn-secondary-text: #eaeaea;
             --btn-secondary-border: rgba(197, 160, 89, 0.4);
+
+            /* Hover Variables (Dark Mode) */
+            --btn-hover-bg: linear-gradient(145deg, #a30033 0%, #5e001f 100%);
+            --btn-hover-filter: brightness(1.1);
+            --btn-hover-transform: translateY(-2px);
+            --btn-hover-shadow: 0 0 20px rgba(139, 0, 50, 0.6);
+            --btn-hover-border: rgba(212, 175, 55, 0.8);
+            --btn-hover-color: #ffffff;
+
+            --btn-sec-hover-bg: rgba(255, 255, 255, 0.1);
+            --btn-sec-hover-border: rgba(212, 175, 55, 0.8);
+            --btn-sec-hover-color: #ffffff;
         """
     else:
-        # 默认：浅色粉系（参考截图风格）
+        # 默认：简明模式（仿截图风格 - 干净、纸张感、暖白）
         vars_css = """
-            --bg: #faf7fb;
-            --bg-glow-1: rgba(255, 92, 147, 0.16);
-            --bg-glow-2: rgba(255, 200, 221, 0.22);
+            --bg: #ffffff;
+            --bg-glow-1: transparent;
+            --bg-glow-2: transparent;
+            
             --panel: #ffffff;
-            --panel-2: rgba(255, 255, 255, 0.92);
-            --text: #111827;
-            --muted: #6b7280;
-            --border: rgba(17, 24, 39, 0.12);
-            --accent: #ff5c93;
-            --accent-2: #ff3b82;
-            --accent-hover: #ff3b82;
-            --accent-2-hover: #ff1f6d;
-            --accent-shadow: rgba(255, 92, 147, 0.16);
-            --accent-shadow-hover: rgba(255, 92, 147, 0.20);
-            --accent-focus: rgba(255, 92, 147, 0.55);
-            --accent-focus-shadow: rgba(255, 92, 147, 0.14);
-            --shadow: 0 10px 24px rgba(17, 24, 39, 0.08);
-            --sidebar-bg: rgba(255, 255, 255, 0.92);
-            --input-bg: rgba(255, 255, 255, 0.98);
-            --code-bg: rgba(17, 24, 39, 0.04);
+            --panel-2: #fcfcfc;     /* Almost white */
+            --text: #202124;        /* Google Sans Black / Deep Grey */
+            --muted: #5f6368;       /* Secondary Text */
+            --border: #dadce0;      /* Subtle border */
 
-            /* Button Specifics (Light Mode - Simple) */
-            --btn-primary-bg: linear-gradient(135deg, #ff5c93 0%, #ff3b82 100%);
+            /* Concise Accents (Lighter Silver) */
+            --accent: #bdbdbd;      /* Lighter Grey */
+            --accent-2: #757575;    /* Material Grey 600 */
+            
+            --accent-hover: #9e9e9e;
+            --accent-2-hover: #616161; 
+            
+            --accent-shadow: rgba(0, 0, 0, 0.02);
+            --accent-shadow-hover: rgba(0, 0, 0, 0.05);
+            
+            --accent-focus: #f5f5f5;
+            --accent-focus-shadow: rgba(0, 0, 0, 0.02);
+            
+            --shadow: none;
+            
+            --sidebar-bg: #f8f9fa;
+            
+            --input-bg: #ffffff;
+            --code-bg: #f1f3f4;
+
+            /* Button Specifics (Lighter Gray) */
+            --btn-primary-bg: #cccccc;
             --btn-primary-text: #ffffff;
-            --btn-primary-border: rgba(17, 24, 39, 0.12);
+            --btn-primary-border: #cccccc;
 
             --btn-secondary-bg: #ffffff;
-            --btn-secondary-text: #111827;
-            --btn-secondary-border: rgba(17, 24, 39, 0.12);
+            --btn-secondary-text: #999999;
+            --btn-secondary-border: #eeeeee;
+
+            /* Hover Variables (Light Mode) */
+            --btn-hover-bg: #e0e0e0;
+            --btn-hover-filter: brightness(1.08);
+            --btn-hover-transform: translateY(-1px);
+            --btn-hover-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+            --btn-hover-border: #d8d8d8;
+            --btn-hover-color: #ffffff;
+
+            --btn-sec-hover-bg: #f8f8f8;
+            --btn-sec-hover-border: #e0e0e0;
+            --btn-sec-hover-color: #666666;
         """
 
     st.markdown(f"<style>:root{{{vars_css}}}</style>", unsafe_allow_html=True)
@@ -837,14 +1319,26 @@ def _render_data_dashboard(
             horizontal=True,
         )
         accepted_only = scope.startswith("仅 Accept")
-        limit = st.slider(
-            "抓取数量上限",
-            10,
-            300,
-            50,
-            help="当开启“仅 Accept”时，这个上限指 accepted 论文数量；系统会扫描更多 submission 直到凑够或扫完。"
-            "当开启“追加抓取（只抓新论文）”时，这个上限指“新增论文数量”。",
+        # 新增：一键抓取所有 AC 论文
+        fetch_all_ac = st.checkbox(
+            "抓取该会议全部 Accept 论文（不限数量）",
+            value=False,
+            help="开启后：将忽略上方“抓取范围”和下方“数量上限”，自动抓取该会议的所有接收论文（可能包含数千篇，耗时较长）。",
         )
+
+        if fetch_all_ac:
+            accepted_only = True
+            limit = None
+            st.info("已开启全量抓取：将获取该会议所有 Accepted 论文。", icon="🚀")
+        else:
+            limit = st.slider(
+                "抓取数量上限",
+                10,
+                300,
+                50,
+                help="当开启“仅 Accept”时，这个上限指 accepted 论文数量；系统会扫描更多 submission 直到凑够或扫完。"
+                "当开启“追加抓取（只抓新论文）”时，这个上限指“新增论文数量”。",
+            )
 
         skip_existing = st.checkbox(
             "追加抓取（只抓新论文，跳过已入库 paper_id）",
@@ -1020,7 +1514,7 @@ def _render_data_dashboard(
 
             # 预检：embedding 不可用时直接提示（否则会在终端刷屏且无法语义检索）
             if (not use_fake_embeddings) and (not embedding_api_key):
-                st.error("未配置 Embedding 所需的 API Key。请在侧边栏填写 Key，或开启“离线 Embedding”。")
+                st.error('未配置 Embedding 所需的 API Key。请在侧边栏填写 Key，或开启"离线 Embedding"。')
                 st.stop()
 
             if not use_fake_embeddings:
@@ -1033,10 +1527,11 @@ def _render_data_dashboard(
                 if not test_vec:
                     st.error(
                         f"Embedding 初始化失败：模型 `{embedding_model}` 不存在/不支持或鉴权失败。"
-                        "请更换 Embedding Model（注意：embedding 模型通常与聊天模型不同），或开启“离线 Embedding”。"
+                        '请更换 Embedding Model（注意：embedding 模型通常与聊天模型不同），或开启"离线 Embedding"。'
                     )
                     st.stop()
 
+            # 创建 KnowledgeBase 和 Ingestor
             kb = KnowledgeBase(
                 embedding_model=embedding_model,
                 embedding_api_key=embedding_api_key,
@@ -1045,115 +1540,127 @@ def _render_data_dashboard(
             kb.initialize_db()
             ingestor = OpenReviewIngestor(kb, fetcher=ConferenceDataFetcher(output_dir="data/raw"))
 
-            with st.status("正在抓取 OpenReview...", expanded=True) as status:
-                st.write("抓取 / 下载 / 解析 / 建索引 ...")
-                fetch_bar = st.progress(0)
-                fetch_text = st.empty()
-                dl_bar = st.progress(0)
-                dl_text = st.empty()
-                parse_bar = st.progress(0)
-                parse_text = st.empty()
-                embed_bar = st.progress(0)
-                embed_text = st.empty()
+            # 创建后台任务并启动
+            job = _IngestJob(
+                job_id=f"ingest-{uuid.uuid4().hex[:8]}",
+                venue_id=venue_id,
+            )
+            job.thread = threading.Thread(
+                target=_run_ingest_job,
+                kwargs={
+                    "job": job,
+                    "ingestor": ingestor,
+                    "venue_id": venue_id,
+                    "limit": limit,
+                    "accepted_only": accepted_only,
+                    "presentation_in": presentation_in,
+                    "skip_existing": skip_existing,
+                    "download_pdfs": download_pdfs,
+                    "parse_pdfs": parse_pdfs,
+                    "max_pdf_pages": max_pages if parse_pdfs else None,
+                    "max_downloads": limit if download_pdfs else None,
+                },
+                daemon=True,
+            )
+            job.thread.start()
+            st.session_state["ingest_job"] = job
+            _rerun()
 
-                def _on_progress(payload):
-                    if not isinstance(payload, dict):
-                        return
-                    stage = payload.get("stage")
-                    cur = int(payload.get("current") or 0)
-                    tot = int(payload.get("total") or 0)
-                    # 某些阶段没有 total（或 total=0），这里不强制 return
-                    pct = int(cur * 100 / tot) if tot > 0 else 0
-
-                    if stage == "fetch_papers":
-                        if tot > 0:
-                            fetch_bar.progress(min(100, max(0, pct)))
-                        scanned = payload.get("scanned")
-                        suffix = f"（扫描 {scanned}）" if scanned is not None else ""
-                        fetch_text.caption(f"抓取元数据：{cur}/{tot}{suffix}")
-                        return
-
-                    if stage == "download_pdf":
-                        dl_bar.progress(min(100, max(0, pct)))
-                        dl_text.caption(f"下载 PDF：{cur}/{tot}")
-                        return
-
-                    if stage == "parse_pdf":
-                        parse_bar.progress(min(100, max(0, pct)))
-                        title = payload.get("title") or ""
-                        parse_text.caption(f"解析 PDF：{cur}/{tot} · {title[:60]}")
-                        return
-
-                    if stage in {"write_papers_table", "prepare_chunks", "prepare_chunks_done"}:
-                        # 这些阶段发生在 Embedding chunks 之前，容易让人误以为“卡住”
-                        if stage == "write_papers_table":
-                            state = payload.get("state")
-                            rows = payload.get("rows")
-                            if state == "start":
-                                embed_text.caption(f"写入向量表（papers）：rows={rows} ...")
-                            else:
-                                dt = payload.get("elapsed")
-                                try:
-                                    embed_text.caption(f"写入向量表（papers）完成：rows={rows} · dt={float(dt):.2f}s")
-                                except Exception:
-                                    embed_text.caption(f"写入向量表（papers）完成：rows={rows}")
-                            return
-
-                        if stage == "prepare_chunks":
-                            chunks = payload.get("chunks")
-                            if tot > 0:
-                                embed_bar.progress(min(100, max(0, pct)))
-                            extra = f" · chunks≈{chunks}" if chunks is not None else ""
-                            embed_text.caption(f"准备 chunks（切分文本）：{cur}/{tot}{extra}")
-                            return
-
-                        if stage == "prepare_chunks_done":
-                            chunks = payload.get("chunks")
-                            dt = payload.get("elapsed")
-                            try:
-                                embed_text.caption(f"准备 chunks 完成：chunks={chunks} · dt={float(dt):.1f}s")
-                            except Exception:
-                                embed_text.caption(f"准备 chunks 完成：chunks={chunks}")
-                            return
-
-                    if stage in {"embed_papers", "embed_chunks"}:
-                        if tot > 0:
-                            embed_bar.progress(min(100, max(0, pct)))
-                        which = "papers" if stage == "embed_papers" else "chunks"
-                        b = payload.get("batch")
-                        bs = payload.get("batches")
-                        extra = f" · batch {b}/{bs}" if b and bs else ""
-                        embed_text.caption(f"Embedding {which}：{cur}/{tot}{extra}")
-                        return
-
-                papers = ingestor.ingest_venue(
-                    venue_id=venue_id,
-                    limit=limit,
-                    accepted_only=accepted_only,
-                    presentation_in=presentation_in,
-                    skip_existing=skip_existing,
-                    download_pdfs=download_pdfs,
-                    parse_pdfs=parse_pdfs,
-                    max_pdf_pages=max_pages if parse_pdfs else None,
-                    max_downloads=limit if download_pdfs else None,
-                    on_progress=_on_progress,
-                )
-                dl_bar.progress(100)
-                parse_bar.progress(100)
-                status.update(label="入库完成！", state="complete")
-
-            try:
-                decided = sum(1 for p in (papers or []) if (p or {}).get("decision"))
-                rated = sum(1 for p in (papers or []) if (p or {}).get("rating") is not None)
-                reviewed = sum(1 for p in (papers or []) if (p or {}).get("reviews"))
-                rebuttals = sum(1 for p in (papers or []) if str((p or {}).get("rebuttal_text") or "").strip())
-                decision_notes = sum(1 for p in (papers or []) if str((p or {}).get("decision_text") or "").strip())
-                st.success(
-                    f"成功入库 {len(papers)} 篇论文（decision={decided} · rating={rated} · reviews={reviewed} · "
-                    f"decision_note={decision_notes} · rebuttal={rebuttals}）"
-                )
-            except Exception:
-                st.success(f"成功入库 {len(papers)} 篇论文。")
+        # -------------------------------------------------------
+        # 入库任务进度显示（使用 @st.fragment 实现独立刷新）
+        # -------------------------------------------------------
+        ingest_job: Optional[_IngestJob] = st.session_state.get("ingest_job")
+        if ingest_job is not None:
+            st.divider()
+            
+            @st.fragment(run_every="0.8s")
+            def _ingest_progress_fragment():
+                """独立刷新的进度 Fragment：不受外部 UI 变化影响"""
+                job = st.session_state.get("ingest_job")
+                if job is None:
+                    return
+                
+                with job.lock:
+                    status = job.status
+                    message = job.message
+                    progress = dict(job.progress)
+                    result = list(job.result) if job.result else []
+                    error = job.error
+                    error_trace = job.error_trace
+                
+                if status == "running":
+                    st.info(f"🔄 {message}")
+                    
+                    # 显示各阶段进度条
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fetch_p = progress.get("fetch_papers", {})
+                        if fetch_p:
+                            cur, tot = fetch_p.get("current", 0), fetch_p.get("total", 0)
+                            pct = int(cur * 100 / tot) if tot > 0 else 0
+                            st.caption(f"抓取元数据: {cur}/{tot}")
+                            st.progress(min(100, pct))
+                        
+                        parse_p = progress.get("parse_pdf", {})
+                        if parse_p:
+                            cur, tot = parse_p.get("current", 0), parse_p.get("total", 0)
+                            pct = int(cur * 100 / tot) if tot > 0 else 0
+                            st.caption(f"解析 PDF: {cur}/{tot}")
+                            st.progress(min(100, pct))
+                    
+                    with col2:
+                        dl_p = progress.get("download_pdf", {})
+                        if dl_p:
+                            cur, tot = dl_p.get("current", 0), dl_p.get("total", 0)
+                            pct = int(cur * 100 / tot) if tot > 0 else 0
+                            st.caption(f"下载 PDF: {cur}/{tot}")
+                            st.progress(min(100, pct))
+                        
+                        embed_p = progress.get("embed_chunks", {}) or progress.get("embed_papers", {})
+                        if embed_p:
+                            cur, tot = embed_p.get("current", 0), embed_p.get("total", 0)
+                            pct = int(cur * 100 / tot) if tot > 0 else 0
+                            st.caption(f"Embedding: {cur}/{tot}")
+                            st.progress(min(100, pct))
+                    
+                    # 停止按钮
+                    if st.button("⏹ 停止入库", key="stop_ingest_btn"):
+                        job.cancel_event.set()
+                        st.warning("正在停止...")
+                
+                elif status == "done":
+                    st.success(f"✅ {message}")
+                    # 显示统计
+                    try:
+                        papers = result
+                        decided = sum(1 for p in (papers or []) if (p or {}).get("decision"))
+                        rated = sum(1 for p in (papers or []) if (p or {}).get("rating") is not None)
+                        reviewed = sum(1 for p in (papers or []) if (p or {}).get("reviews"))
+                        st.caption(f"decision={decided} · rating={rated} · reviews={reviewed}")
+                    except Exception:
+                        pass
+                    # 清除 job 以结束 fragment 刷新
+                    if st.button("清除", key="clear_ingest_job"):
+                        st.session_state.pop("ingest_job", None)
+                        _rerun()
+                
+                elif status == "cancelled":
+                    st.warning(f"⚠️ {message}")
+                    if st.button("清除", key="clear_ingest_job_cancelled"):
+                        st.session_state.pop("ingest_job", None)
+                        _rerun()
+                
+                elif status == "error":
+                    st.error(f"❌ {message}")
+                    if error_trace:
+                        with st.expander("错误详情"):
+                            st.code(error_trace)
+                    if st.button("清除", key="clear_ingest_job_error"):
+                        st.session_state.pop("ingest_job", None)
+                        _rerun()
+            
+            # 调用 Fragment
+            _ingest_progress_fragment()
 
 
 def _render_research_agent(
@@ -1188,6 +1695,7 @@ def _render_research_agent(
 
     # 新问题：由首页输入框 / 底部 chat_input 写入 session_state
     user_query = st.session_state.pop("pending_user_query", None)
+    has_auth = bool((chat_api_key or "").strip())
 
     has_messages = bool(st.session_state.get("messages"))
     has_any_result = bool(st.session_state.get("pending_plan") or st.session_state.get("final_report"))
@@ -1208,6 +1716,12 @@ def _render_research_agent(
         )
 
         st.write("")
+        if not has_auth:
+            st.warning(
+                "运行前需要配置鉴权：请在左侧栏填写 **API Key**，或输入正确的 **Access Code**（用于启用系统 Key）。"
+                "否则无法进行「规划/写作/核查」。",
+                icon="🔑",
+            )
         # 兼容 Streamlit 1.26：st.container 不支持 border 参数
         # 这里用 st.form 做“卡片容器”，再用 CSS 把 form 渲染成卡片。
         with st.form("landing_card", clear_on_submit=False):
@@ -1256,6 +1770,11 @@ def _render_research_agent(
         if do_run:
             if not (topic or "").strip():
                 st.warning("请先填写「研究问题 / 报告主题」。")
+            elif not has_auth:
+                st.warning(
+                    "未配置鉴权：请先在左侧栏填写 **API Key** 或输入正确 **Access Code**，否则无法开始生成。",
+                    icon="🔑",
+                )
             else:
                 q = topic.strip()
                 if (keywords or "").strip():
@@ -1282,8 +1801,14 @@ def _render_research_agent(
                         **_width_kwargs(st.form_submit_button, stretch=True),
                     )
                 if use_it:
-                    st.session_state["pending_user_query"] = q
-                    _rerun()
+                    if not has_auth:
+                        st.warning(
+                            "未配置鉴权：请先在左侧栏填写 **API Key** 或输入正确 **Access Code**，否则无法开始生成。",
+                            icon="🔑",
+                        )
+                    else:
+                        st.session_state["pending_user_query"] = q
+                        _rerun()
 
         return
 
@@ -1315,9 +1840,18 @@ def _render_research_agent(
             st.session_state["pending_plan"] = None
             st.session_state["plan_editor_text"] = ""
 
-            # 初始化 LLM（用于 Planner）
-            llm = get_llm_client(api_key=chat_api_key, base_url=chat_base_url)
-            if not llm:
+            # 启动后台规划任务（支持停止）
+            # 若已有规划任务在跑，先尝试取消（协作式）
+            old_pj = st.session_state.get("plan_job")
+            try:
+                if isinstance(old_pj, _PlanJob) and old_pj.status == "running":
+                    old_pj.cancel_event.set()
+            except Exception:
+                pass
+
+            # Demo 门禁：不允许 get_llm_client 从环境变量偷拿 OPENAI_API_KEY
+            llm_probe = get_llm_client(api_key=chat_api_key, base_url=chat_base_url, allow_env_fallback=False)
+            if not llm_probe:
                 st.error("Authentication Failed. Please provide a valid Access Code or your own API Key.")
             else:
                 # DB stats（给 planner 用）
@@ -1330,29 +1864,107 @@ def _render_research_agent(
                         stats["avg_rating"] = None
                     try:
                         if "decision" in df.columns:
-                            stats["decision_counts"] = (
-                                df["decision"].fillna("UNKNOWN").value_counts().head(10).to_dict()
-                            )
+                            stats["decision_counts"] = df["decision"].fillna("UNKNOWN").value_counts().head(10).to_dict()
                     except Exception:
                         pass
 
-                planner = PlannerAgent(llm, model=model_name)
-                with st.status("正在规划...", expanded=True) as status:
-                    st.write("生成研究计划（Plan）...")
-                    plan = planner.generate_plan(user_query, stats)
+                pj = _PlanJob(job_id=str(uuid.uuid4())[:8], query=str(user_query))
+                st.session_state["plan_job"] = pj
+                th = threading.Thread(
+                    target=_run_plan_job,
+                    kwargs={
+                        "job": pj,
+                        "user_query": str(user_query),
+                        "stats": stats,
+                        "chat_api_key": chat_api_key,
+                        "chat_base_url": chat_base_url,
+                        "model_name": model_name,
+                    },
+                    daemon=True,
+                )
+                pj.thread = th
+                th.start()
+                _rerun()
+                return
+
+        # 规划任务面板（运行中/已完成/已取消/失败）
+        pj = st.session_state.get("plan_job")
+        if isinstance(pj, _PlanJob):
+            with pj.lock:
+                snap = {
+                    "job_id": pj.job_id,
+                    "status": pj.status,
+                    "stage": pj.stage,
+                    "message": pj.message,
+                    "result": dict(pj.result),
+                    "error": pj.error,
+                    "error_trace": pj.error_trace,
+                }
+
+            if snap["status"] == "running":
+                with st.status("正在规划（后台任务）...", expanded=True):
+                    st.write(snap.get("message") or "生成研究计划（Plan）...")
+                    c_stop, c_refresh, c_hint = st.columns([1, 1, 3])
+                    with c_stop:
+                        if st.button("⏹ 停止规划", key=f"plan_stop_{snap['job_id']}"):
+                            try:
+                                pj.cancel_event.set()
+                                _job_update(pj, message="正在停止...（等待当前请求返回）")
+                            except Exception:
+                                pass
+                            _rerun()
+                    with c_refresh:
+                        if st.button("🔄 刷新进度", key=f"plan_refresh_{snap['job_id']}"):
+                            _rerun()
+                    with c_hint:
+                        st.caption("停止为协作式：LLM 单次请求进行中无法强制中断，但会在下一检查点尽快退出。")
+
+            elif snap["status"] == "done":
+                plan = (snap.get("result") or {}).get("plan")
+                applied = bool((snap.get("result") or {}).get("_applied"))
+                if not applied and isinstance(plan, dict):
                     st.session_state["pending_plan"] = plan
                     st.session_state["plan_editor_text"] = json.dumps(plan, ensure_ascii=False, indent=2)
-
-                    if isinstance(plan, dict) and (plan.get("_error") or plan.get("title") == "Error in Planning"):
-                        status.update(label="规划失败（请检查模型/接口能力）", state="error")
+                    if plan.get("_error") or plan.get("title") == "Error in Planning":
                         err = plan.get("_error") or "unknown"
-                        st.error(
+                        st.session_state["plan_flash_error"] = (
                             "Planner 生成计划失败。常见原因：模型不支持 JSON mode（例如部分 GLM 会报 code=20024），"
                             "或 Model Name/Base URL 不匹配。\n\n"
                             f"错误信息：{err}"
                         )
                     else:
-                        status.update(label="计划已生成（等待你确认/编辑）", state="complete")
+                        st.session_state["plan_flash"] = "计划已生成（等待你确认/编辑）。"
+                    try:
+                        with pj.lock:
+                            pj.result["_applied"] = True
+                    except Exception:
+                        pass
+                    _rerun()
+                else:
+                    st.success("规划完成 ✅")
+                    if st.button("清除规划状态", key=f"plan_clear_{snap['job_id']}"):
+                        st.session_state.pop("plan_job", None)
+                        _rerun()
+
+            elif snap["status"] == "cancelled":
+                st.warning("规划已停止（Cancelled）")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("清除规划状态", key=f"plan_clear_{snap['job_id']}"):
+                        st.session_state.pop("plan_job", None)
+                        _rerun()
+                with c2:
+                    if st.button("重新规划（同一问题）", key=f"plan_retry_{snap['job_id']}"):
+                        st.session_state["pending_user_query"] = str(getattr(pj, "query", "") or "")
+                        _rerun()
+
+            elif snap["status"] == "error":
+                st.error(f"规划失败：{snap.get('error')}")
+                with st.expander("错误详情（Traceback）", expanded=False):
+                    st.code(str(snap.get("error_trace") or ""), language="text")
+                if st.button("清除规划状态", key=f"plan_clear_{snap['job_id']}"):
+                    st.session_state.pop("plan_job", None)
+                    _rerun()
 
         # 计划审核/编辑/批准
         if st.session_state.get("pending_plan") and not st.session_state.get("plan_approved"):
@@ -1512,121 +2124,178 @@ def _render_research_agent(
 
             # 如果用户点了“确认并运行”，在这里统一执行（避免在 on_click 里跑长任务）
             run_req = st.session_state.pop("plan_run_requested", None)
+            # 研究任务：改为后台线程执行（支持停止）
+            job = st.session_state.get("research_job")
+
+            # 1) 启动任务（点击“确认并运行”触发）
             if run_req:
-                llm = get_llm_client(api_key=chat_api_key, base_url=chat_base_url)
-                if not llm:
-                    st.error("Authentication Failed. Please provide a valid Access Code or your own API Key.")
+                if isinstance(job, _ResearchJob) and job.status == "running":
+                    st.warning("已有任务正在运行。请先停止或等待完成。")
                 else:
-                    plan = st.session_state.get("pending_plan")
-                    if not isinstance(plan, dict):
-                        st.error("计划格式异常：pending_plan 不是 JSON object。")
+                    # 先做一次轻量鉴权检查（避免开线程后立即失败）
+                    llm_probe = get_llm_client(api_key=chat_api_key, base_url=chat_base_url, allow_env_fallback=False)
+                    if not llm_probe:
+                        st.error("Authentication Failed. Please provide a valid Access Code or your own API Key.")
                     else:
-                        st.session_state["plan_approved"] = True
+                        plan = st.session_state.get("pending_plan")
+                        if not isinstance(plan, dict):
+                            st.error("计划格式异常：pending_plan 不是 JSON object。")
+                        else:
+                            st.session_state["plan_approved"] = True
 
-                        researcher = ResearcherAgent(kb, llm, model=model_name)
-                        writer = WriterAgent(llm, model=model_name)
-                        verifier = VerifierAgent(llm, model=model_name)
+                            # 清空上一次结果（与旧行为一致）
+                            st.session_state["research_notes"] = []
+                            st.session_state["final_report"] = ""
+                            st.session_state["verification_result"] = None
+                            st.session_state["report_ref_ctx"] = None
+                            st.session_state["writer_stats"] = None
 
-                        with st.status("正在执行...", expanded=True) as status:
-                            st.write("检索证据（Research）...")
-                            research_bar = st.progress(0)
-                            research_text = st.empty()
+                            job = _ResearchJob(job_id=str(uuid.uuid4())[:8])
+                            st.session_state["research_job"] = job
 
-                            def _on_research_progress(payload):
-                                if not isinstance(payload, dict):
-                                    return
-                                stage = payload.get("stage")
-                                cur = int(payload.get("current") or 0)
-                                tot = int(payload.get("total") or 0)
-                                sec = payload.get("section") or ""
-                                if tot > 0:
-                                    pct = int(cur * 100 / tot)
-                                    research_bar.progress(min(100, max(0, pct)))
-                                if stage == "research_section":
-                                    q = payload.get("query") or ""
-                                    research_text.caption(f"检索中：{cur}/{tot} · {sec} · {str(q)[:60]}")
-                                elif stage == "research_section_done":
-                                    ev = payload.get("evidence")
-                                    sp = payload.get("selected_papers")
-                                    dt = payload.get("elapsed")
-                                    research_text.caption(
-                                        f"完成：{cur}/{tot} · {sec} · papers={sp} · evidence={ev} · {dt:.1f}s"
-                                    )
-
-                            notes = researcher.execute_research(plan, on_progress=_on_research_progress)
-                            research_bar.progress(100)
-                            st.session_state["research_notes"] = notes
-
-                            st.write("循证写作（Write）...")
-                            write_text = st.empty()
-
-                            def _on_write_progress(payload):
-                                if not isinstance(payload, dict):
-                                    return
-                                stage = payload.get("stage")
-                                if stage == "write_refs_built":
-                                    write_text.caption(f"写作准备：refs={payload.get('refs_total')}")
-                                elif stage == "write_payload_built":
-                                    write_text.caption(
-                                        f"写作准备：sections={payload.get('sections')} · evidence={payload.get('evidence_snippets')} · refs={payload.get('allowed_refs_total')}"
-                                    )
-                                elif stage == "write_llm_call":
-                                    pc = payload.get("prompt_chars")
-                                    write_text.caption(f"LLM 生成中：model={payload.get('model')} · prompt_chars={pc}")
-                                elif stage == "write_done":
-                                    dt = payload.get("dt_llm_sec")
-                                    used = payload.get("refs_used")
-                                    total = payload.get("refs_total")
-                                    cov = payload.get("coverage")
-                                    tok = payload.get("total_tokens")
-                                    extra = f" · tokens={tok}" if tok is not None else ""
-                                    try:
-                                        cov_pct = f"{float(cov) * 100:.0f}%" if cov is not None else "?"
-                                    except Exception:
-                                        cov_pct = "?"
-                                    write_text.caption(
-                                        f"写作完成：refs={used}/{total} · 引用覆盖≈{cov_pct} · dt={dt:.1f}s{extra}"
-                                    )
-                                elif stage == "write_error":
-                                    write_text.caption(f"写作失败：{payload.get('error')}")
-
-                            report, ref_ctx = writer.write_report(plan, notes, on_progress=_on_write_progress)
-                            st.session_state["final_report"] = report
-                            st.session_state["report_ref_ctx"] = ref_ctx
+                            # 深拷贝 plan，避免 UI 编辑影响后台线程
                             try:
-                                st.session_state["writer_stats"] = (ref_ctx or {}).get("writer_stats")
+                                plan_copy = json.loads(json.dumps(plan, ensure_ascii=False))
                             except Exception:
-                                st.session_state["writer_stats"] = None
+                                plan_copy = dict(plan)
 
-                            st.write("逐句核查（Verify）...")
-                            chunk_map = {}
-                            for n in notes:
-                                for e in (n.get("evidence") or []):
-                                    cid = e.get("chunk_id")
-                                    txt = e.get("text")
-                                    if cid and txt and cid not in chunk_map:
-                                        chunk_map[cid] = txt
+                            th = threading.Thread(
+                                target=_run_research_job,
+                                kwargs={
+                                    "job": job,
+                                    "plan": plan_copy,
+                                    "chat_api_key": chat_api_key,
+                                    "chat_base_url": chat_base_url,
+                                    "model_name": model_name,
+                                    "embedding_model": embedding_model,
+                                    "embedding_api_key": embedding_api_key,
+                                    "embedding_base_url": embedding_base_url,
+                                },
+                                daemon=True,
+                            )
+                            job.thread = th
+                            th.start()
+                            _rerun()
 
-                            ref_map = {}
-                            try:
-                                ref_map = (ref_ctx or {}).get("ref_map") or {}
-                            except Exception:
-                                ref_map = {}
-                            verification = verifier.verify_report(report, {"chunks": chunk_map, "ref_map": ref_map})
-                            st.session_state["verification_result"] = verification
-
-                            status.update(label="Completed", state="complete")
-
-                        # 给聊天区一个简短回执（不贴整篇报告）
-                        v = st.session_state.get("verification_result") or {}
-                        st.session_state["messages"].append(
-                            {
-                                "role": "assistant",
-                                "content": f"报告已生成。核查：valid={v.get('is_valid')}, score={v.get('score')}.（详见右侧溯源/核查面板）",
-                            }
-                        )
+            # 任务面板在外层统一渲染（保证 plan_approved=True 后也能看到进度/停止按钮）
 
         # 输出最终报告（左栏）
+        # 运行中任务面板（无论 plan 是否已批准，都显示）
+        job = st.session_state.get("research_job")
+        if isinstance(job, _ResearchJob):
+            with job.lock:
+                snap = {
+                    "job_id": job.job_id,
+                    "status": job.status,
+                    "stage": job.stage,
+                    "message": job.message,
+                    "progress": dict(job.progress),
+                    "result": dict(job.result),
+                    "error": job.error,
+                    "error_trace": job.error_trace,
+                    "started_ts": job.started_ts,
+                    "finished_ts": job.finished_ts,
+                }
+
+            if snap["status"] == "running":
+                with st.status("正在执行（后台任务）...", expanded=True):
+                    st.write(snap.get("message") or "运行中...")
+
+                    # research 进度
+                    rp = snap.get("progress", {}).get("research")
+                    if isinstance(rp, dict):
+                        cur = int(rp.get("current") or 0)
+                        tot = int(rp.get("total") or 0)
+                        sec = str(rp.get("section") or "")
+                        q = str(rp.get("query") or "")
+                        if tot > 0:
+                            pct = int(cur * 100 / tot)
+                            st.progress(min(100, max(0, pct)))
+                            st.caption(f"Research：{cur}/{tot} · {sec} · {q[:60]}")
+                        else:
+                            # 部分阶段尚未提供 total（或 total=0），先给一个占位进度条
+                            st.progress(0)
+                            st.caption("Research：准备中…（点「刷新进度」查看更新）")
+                    else:
+                        st.progress(0)
+                        st.caption("Research：准备中…（点「刷新进度」查看更新）")
+
+                    # write 进度（文本型）
+                    wp = snap.get("progress", {}).get("write")
+                    if isinstance(wp, dict):
+                        stg = wp.get("stage")
+                        if stg == "write_refs_built":
+                            st.caption(f"Write：写作准备 refs={wp.get('refs_total')}")
+                        elif stg == "write_payload_built":
+                            st.caption(
+                                f"Write：sections={wp.get('sections')} · evidence={wp.get('evidence_snippets')} · refs={wp.get('allowed_refs_total')}"
+                            )
+                        elif stg == "write_llm_call":
+                            st.caption(f"Write：LLM 生成中 model={wp.get('model')}")
+
+                    c_stop, c_refresh, c_hint = st.columns([1, 1, 3])
+                    with c_stop:
+                        if st.button("⏹ 停止本次运行", key=f"job_stop_{snap['job_id']}"):
+                            try:
+                                job.cancel_event.set()
+                                _job_update(job, message="正在停止...（等待当前请求返回）")
+                            except Exception:
+                                pass
+                            _rerun()
+                    with c_refresh:
+                        if st.button("🔄 刷新进度", key=f"job_refresh_{snap['job_id']}"):
+                            _rerun()
+                    with c_hint:
+                        st.caption(
+                            "停止为协作式：LLM 单次请求进行中无法强制中断，但会在下一检查点尽快退出。"
+                            "（页面不会自动刷新，点「刷新进度」即可更新）"
+                        )
+
+            elif snap["status"] == "done":
+                st.success("任务完成 ✅")
+
+                # 将结果回填到 session_state（只做一次，避免重复追加消息）
+                applied = bool(snap.get("result", {}).get("_applied"))
+                if not applied:
+                    res = snap.get("result", {}) or {}
+                    st.session_state["research_notes"] = res.get("research_notes") or []
+                    st.session_state["final_report"] = str(res.get("final_report") or "")
+                    st.session_state["report_ref_ctx"] = res.get("report_ref_ctx")
+                    st.session_state["writer_stats"] = res.get("writer_stats")
+                    st.session_state["verification_result"] = res.get("verification_result")
+
+                    v = st.session_state.get("verification_result") or {}
+                    st.session_state["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": f"报告已生成。核查：valid={v.get('is_valid')}, score={v.get('score')}.（详见右侧溯源/核查面板）",
+                        }
+                    )
+                    try:
+                        with job.lock:
+                            job.result["_applied"] = True
+                    except Exception:
+                        pass
+
+            elif snap["status"] == "cancelled":
+                st.warning("任务已停止（Cancelled）")
+                if snap.get("error"):
+                    st.caption(str(snap.get("error")))
+
+            elif snap["status"] == "error":
+                st.error(f"任务失败：{snap.get('error')}")
+                with st.expander("错误详情（Traceback）", expanded=False):
+                    st.code(str(snap.get("error_trace") or ""), language="text")
+
+            if snap["status"] in {"done", "cancelled", "error"}:
+                if snap["status"] in {"cancelled", "error"}:
+                    if st.button("返回计划编辑", key=f"job_back_plan_{snap['job_id']}"):
+                        st.session_state["plan_approved"] = False
+                        _rerun()
+                if st.button("清除任务状态", key=f"job_clear_{snap['job_id']}"):
+                    st.session_state.pop("research_job", None)
+                    _rerun()
+
         if st.session_state.get("final_report"):
             st.divider()
             st.subheader("最终报告")
@@ -1653,6 +2322,18 @@ def _render_research_agent(
                 st.caption(f"Verification: valid={v.get('is_valid')} · score={v.get('score')} · {v.get('notes')}")
 
     with col_context:
+        # 浮动窗口：看最终报告时也能随时看到核查/证据（右栏内部滚动）
+        float_default = bool(st.session_state.get("final_report"))
+        float_panel = st.checkbox(
+            "浮动窗口：证据与核查（看报告时保持可见）",
+            value=bool(st.session_state.get("float_evidence_panel", float_default)),
+            key="float_evidence_panel",
+            help="开启后右侧面板会变成粘性窗口，并在内部滚动；适合边看最终报告边对照核查。",
+        )
+
+        if float_panel:
+            st.markdown('<div class="mujica-float-wrap"><div class="mujica-float-card">', unsafe_allow_html=True)
+
         st.subheader("证据与核查")
 
         tab_evi, tab_ver = st.tabs(["Evidence（证据）", "Verification（核查）"])
@@ -1729,23 +2410,136 @@ def _render_research_agent(
             if not isinstance(v, dict) or not v:
                 st.info("暂无核查结果。生成报告后会自动触发核查。", icon="ℹ️")
             else:
-                st.caption(f"valid={v.get('is_valid')} · score={v.get('score')} · {v.get('notes')}")
                 evals = v.get("evaluations") or []
+
+                # 汇总信息（更直观）
+                try:
+                    checked = int((v.get("stats") or {}).get("claims_checked") or 0)
+                except Exception:
+                    checked = 0
+                if not checked and isinstance(evals, list):
+                    checked = len(evals)
+
+                supports = 0
+                contradicts = 0
+                unknowns = 0
+                for it in (evals or []):
+                    lbl = str((it or {}).get("label") or "unknown").lower().strip()
+                    if lbl == "entailed":
+                        supports += 1
+                    elif lbl == "contradicted":
+                        contradicts += 1
+                    else:
+                        unknowns += 1
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("valid", bool(v.get("is_valid")))
+                try:
+                    c2.metric("score", f"{float(v.get('score') or 0.0):.2f}")
+                except Exception:
+                    c2.metric("score", str(v.get("score")))
+                c3.metric("checked", int(checked))
+                c4.metric("contradicts", int(contradicts))
+                st.caption(str(v.get("notes") or "").strip())
+
                 if evals:
                     try:
                         import pandas as pd
 
-                        st.dataframe(pd.DataFrame(evals), **_width_kwargs(st.dataframe, stretch=True))
+                        # 表格美化：只保留关键信息，避免 citations 显示为 [object Object]
+                        ref_ctx = st.session_state.get("report_ref_ctx") or {}
+                        chunk_to_ref = {}
+                        try:
+                            chunk_to_ref = (ref_ctx or {}).get("chunk_to_ref") or {}
+                        except Exception:
+                            chunk_to_ref = {}
+
+                        def _label_zh(lbl: str) -> str:
+                            s = (lbl or "").lower().strip()
+                            if s == "entailed":
+                                return "支持"
+                            if s == "contradicted":
+                                return "矛盾"
+                            return "不确定"
+
+                        def _format_citations(cits: Any) -> str:
+                            if not isinstance(cits, list) or not cits:
+                                return ""
+                            refs = []
+                            for c in cits:
+                                if not isinstance(c, dict):
+                                    continue
+                                r = str(c.get("ref") or "").strip()
+                                if r:
+                                    refs.append(r)
+                                    continue
+                                cid = str(c.get("chunk_id") or "").strip()
+                                rid = chunk_to_ref.get(cid) if isinstance(chunk_to_ref, dict) else None
+                                if rid:
+                                    refs.append(str(rid))
+                            # 去重、限长
+                            out = []
+                            seen = set()
+                            for r in refs:
+                                if r in seen:
+                                    continue
+                                seen.add(r)
+                                out.append(r)
+                            if out:
+                                if len(out) > 5:
+                                    return ", ".join(out[:5]) + f" (+{len(out)-5})"
+                                return ", ".join(out)
+                            # fallback：只显示数量
+                            return f"{len(cits)} 条引用"
+
+                        rows: List[Dict[str, Any]] = []
+                        for i, it in enumerate(evals):
+                            if not isinstance(it, dict):
+                                continue
+                            claim = str(it.get("claim") or "").strip()
+                            claim_short = claim
+                            if len(claim_short) > 160:
+                                claim_short = claim_short[:160].rstrip() + "…"
+                            lbl_raw = str(it.get("label") or "unknown")
+                            try:
+                                sc = float(it.get("score") or 0.0)
+                            except Exception:
+                                sc = 0.0
+                            cits = it.get("citations") or []
+                            rows.append(
+                                {
+                                    "序号": i + 1,
+                                    "结论": _label_zh(lbl_raw),
+                                    "分数": round(sc, 2),
+                                    "引用": _format_citations(cits),
+                                    "要点（claim）": claim_short,
+                                }
+                            )
+
+                        df = pd.DataFrame(rows)
+                        st.dataframe(df, **_width_kwargs(st.dataframe, stretch=True))
+
+                        with st.expander("查看核查明细（原始 JSON）", expanded=False):
+                            st.json(evals, expanded=False)
                     except Exception:
                         st.json(evals, expanded=False)
                 else:
                     st.json(v, expanded=False)
 
+        if float_panel:
+            st.markdown("</div></div>", unsafe_allow_html=True)
+
     # Chat 输入框必须位于页面根容器（不能在 columns/tabs/sidebar/expander/form 内）
     prompt = st.chat_input("输入你的研究问题（按 Enter 发送）")
     if prompt:
-        st.session_state["pending_user_query"] = prompt
-        _rerun()
+        if not has_auth:
+            st.warning(
+                "未配置鉴权：请先在左侧栏填写 **API Key** 或输入正确 **Access Code**，否则无法开始生成。",
+                icon="🔑",
+            )
+        else:
+            st.session_state["pending_user_query"] = prompt
+            _rerun()
 
 
 def main() -> None:
@@ -1775,11 +2569,72 @@ def main() -> None:
     st.session_state.setdefault("plan_approved", False)
     st.session_state.setdefault("verification_result", None)
 
+    # 对话历史（默认开启；不提供 UI 开关）
+    # 如需关闭（例如 HF Spaces 多人 demo 避免互相可见），可设置：MUJICA_DISABLE_CHAT_HISTORY=1
+    disable_hist = (os.getenv("MUJICA_DISABLE_CHAT_HISTORY") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    st.session_state.setdefault("enable_chat_history", not disable_hist)
+    st.session_state.setdefault("conversation_id", None)
+    st.session_state.setdefault("conversation_title", "")
+    st.session_state.setdefault("history_loaded", False)
+    st.session_state.setdefault("history_created_ts", time.time())
+    st.session_state.setdefault("history_last_hash", "")
+
+    # 处理 URL query params：
+    # - cid：用于刷新/重开后恢复当前对话
+    # - go=home：点击左上角 MUJICA 回到首页（清空工作区）
+    qp = _get_query_params()
+    go = (qp.get("go") or [None])[0]
+    cid = (qp.get("cid") or [None])[0]
+
+    if str(go or "").lower() == "home":
+        _reset_workspace_state(cancel_running_job=True)
+        # 清理 go 参数，保留 cid（若有）
+        _set_query_params(cid=cid or st.session_state.get("conversation_id"))
+        _rerun()
+        return
+
+    if st.session_state.get("enable_chat_history"):
+        # 恢复/初始化 conversation_id
+        if cid and not st.session_state.get("conversation_id"):
+            st.session_state["conversation_id"] = str(cid)
+        if not st.session_state.get("conversation_id"):
+            st.session_state["conversation_id"] = new_conversation_id()
+            _set_query_params(cid=st.session_state["conversation_id"])
+        # 首次加载：如果有历史文件则恢复
+        if (not st.session_state.get("history_loaded")) and st.session_state.get("conversation_id"):
+            snap = load_conversation(str(st.session_state.get("conversation_id") or ""))
+            if isinstance(snap, dict) and snap:
+                # 只恢复“工作区相关状态”，不覆盖模型配置/鉴权字段
+                try:
+                    st.session_state["conversation_title"] = str(snap.get("title") or "").strip()
+                except Exception:
+                    st.session_state["conversation_title"] = ""
+                st.session_state["messages"] = snap.get("messages") or []
+                st.session_state["research_notes"] = snap.get("research_notes") or []
+                st.session_state["final_report"] = str(snap.get("final_report") or "")
+                st.session_state["report_ref_ctx"] = snap.get("report_ref_ctx")
+                st.session_state["writer_stats"] = snap.get("writer_stats")
+                st.session_state["pending_plan"] = snap.get("pending_plan")
+                st.session_state["plan_editor_text"] = str(snap.get("plan_editor_text") or "")
+                st.session_state["plan_approved"] = bool(snap.get("plan_approved"))
+                st.session_state["verification_result"] = snap.get("verification_result")
+                # 轻量恢复 UI 外观/导航
+                if snap.get("system_mode") in {"research", "data"}:
+                    st.session_state["system_mode"] = snap.get("system_mode")
+                if snap.get("ui_theme") in {"light", "dark"}:
+                    st.session_state["ui_theme"] = snap.get("ui_theme")
+                try:
+                    st.session_state["history_created_ts"] = float(snap.get("created_ts") or time.time())
+                except Exception:
+                    st.session_state["history_created_ts"] = time.time()
+            st.session_state["history_loaded"] = True
+
     _local_css(Path(__file__).with_name("style.css"))
     _apply_theme_vars(st.session_state.get("ui_theme"))
 
     with st.sidebar:
-        st.title("MUJICA")
+        # 点击品牌回首页（通过 query param 触发 reset）
+        st.markdown('<a class="mujica-brand-link" href="?go=home">MUJICA</a>', unsafe_allow_html=True)
         st.caption("Multi-stage User-Judged Integration")
 
         st.divider()
@@ -1797,6 +2652,184 @@ def main() -> None:
             key="system_mode",
             format_func=lambda x: "🏠 首页" if x == "research" else "📚 知识库",
         )
+
+        st.divider()
+        st.subheader("运行控制")
+        
+        @st.fragment(run_every="0.8s")
+        def _job_control_fragment():
+            """独立刷新的 Fragment：显示 Plan/Research 任务进度"""
+            pj = st.session_state.get("plan_job")
+            if isinstance(pj, _PlanJob) and pj.status == "running":
+                st.caption(f"规划中：{str(getattr(pj, 'query', '') or '')[:60]}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("⏹ 停止规划", key=f"sb_stop_plan_{pj.job_id}"):
+                        try:
+                            pj.cancel_event.set()
+                            _job_update(pj, message="正在停止规划...（等待当前请求返回）")
+                        except Exception:
+                            pass
+                with c2:
+                    pass  # 自动刷新，无需手动刷新按钮
+            else:
+                st.caption("规划：无")
+
+            rj = st.session_state.get("research_job")
+            if isinstance(rj, _ResearchJob) and rj.status == "running":
+                # 在侧边栏展示进度（更容易找到"进度条"）
+                try:
+                    with rj.lock:
+                        rj_stage = str(rj.stage or "")
+                        rj_msg = str(rj.message or "")
+                        rj_prog = dict(rj.progress or {})
+                except Exception:
+                    rj_stage = str(getattr(rj, "stage", "") or "")
+                    rj_msg = str(getattr(rj, "message", "") or "")
+                    rj_prog = {}
+
+                st.caption(f"研究运行中：{rj_stage or 'running'}")
+                if rj_msg.strip():
+                    st.caption(rj_msg.strip())
+
+                rp = rj_prog.get("research")
+                if isinstance(rp, dict):
+                    cur = int(rp.get("current") or 0)
+                    tot = int(rp.get("total") or 0)
+                    sec = str(rp.get("section") or "")
+                    if tot > 0:
+                        pct = int(cur * 100 / tot)
+                        st.progress(min(100, max(0, pct)))
+                        st.caption(f"Research：{cur}/{tot} · {sec}")
+                    else:
+                        st.progress(0)
+                else:
+                    st.progress(0)
+
+                try:
+                    ts = float(rj_prog.get("_ts") or 0.0)
+                    if ts > 0:
+                        st.caption(f"最后更新：{time.time() - ts:.1f}s 前")
+                except Exception:
+                    pass
+                
+                if st.button("⏹ 停止运行", key=f"sb_stop_run_{rj.job_id}"):
+                    try:
+                        rj.cancel_event.set()
+                        _job_update(rj, message="正在停止...（等待当前请求返回）")
+                    except Exception:
+                        pass
+            else:
+                st.caption("运行：无")
+        
+        # 调用 Fragment
+        _job_control_fragment()
+
+        st.divider()
+        st.subheader("对话")
+        if not st.session_state.get("enable_chat_history"):
+            st.caption("历史对话已关闭（设置 MUJICA_DISABLE_CHAT_HISTORY=1）。")
+        else:
+            cid_now = str(st.session_state.get("conversation_id") or "")
+            items = list_conversations(limit=60)
+
+            # 确保当前 cid 在列表里（新对话尚未写盘时）
+            if cid_now and (not any((it or {}).get("cid") == cid_now for it in items)):
+                cur_title = str(st.session_state.get("conversation_title") or "").strip() or "（当前对话）"
+                items = [{"cid": cid_now, "title": cur_title, "updated_ts": time.time()}] + items
+
+            if st.button("➕ 新聊天", key="history_new_chat", **_width_kwargs(st.button, stretch=True)):
+                _reset_workspace_state(cancel_running_job=True)
+                st.session_state["conversation_id"] = new_conversation_id()
+                st.session_state["conversation_title"] = ""
+                st.session_state["history_loaded"] = True  # 新对话无需加载
+                st.session_state["history_created_ts"] = time.time()
+                st.session_state.pop("history_menu_cid", None)
+                st.session_state.pop("history_rename_cid", None)
+                st.session_state.pop("history_delete_cid", None)
+                _set_query_params(cid=st.session_state["conversation_id"])
+                _rerun()
+
+            # ChatGPT 风格：列表 + 省略号菜单（重命名/删除）
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                cid_it = str(it.get("cid") or "").strip()
+                if not cid_it:
+                    continue
+                title = str(it.get("title") or "未命名对话").strip() or "未命名对话"
+                title_disp = title if len(title) <= 28 else (title[:28].rstrip() + "…")
+                is_current = cid_it == cid_now
+
+                col_t, col_m = st.columns([0.86, 0.14])
+                with col_t:
+                    label = f"● {title_disp}" if is_current else title_disp
+                    if st.button(label, key=f"hist_open_{cid_it}"):
+                        if cid_it != cid_now:
+                            _reset_workspace_state(cancel_running_job=True)
+                            st.session_state["conversation_id"] = cid_it
+                            st.session_state["conversation_title"] = ""
+                            st.session_state["history_loaded"] = False  # 触发加载
+                            st.session_state.pop("history_menu_cid", None)
+                            st.session_state.pop("history_rename_cid", None)
+                            st.session_state.pop("history_delete_cid", None)
+                            _set_query_params(cid=cid_it)
+                            _rerun()
+                with col_m:
+                    if st.button("⋯", key=f"hist_menu_{cid_it}"):
+                        cur = str(st.session_state.get("history_menu_cid") or "")
+                        st.session_state["history_menu_cid"] = None if cur == cid_it else cid_it
+                        st.session_state.pop("history_rename_cid", None)
+                        st.session_state.pop("history_delete_cid", None)
+                        _rerun()
+
+                if str(st.session_state.get("history_menu_cid") or "") == cid_it:
+                    a1, a2 = st.columns(2)
+                    with a1:
+                        if st.button("✏️ 重命名", key=f"hist_act_rename_{cid_it}"):
+                            st.session_state["history_rename_cid"] = cid_it
+                            st.session_state[f"hist_rename_text_{cid_it}"] = title
+                            _rerun()
+                    with a2:
+                        if st.button("🗑 删除", key=f"hist_act_delete_{cid_it}"):
+                            st.session_state["history_delete_cid"] = cid_it
+                            _rerun()
+
+                    if str(st.session_state.get("history_rename_cid") or "") == cid_it:
+                        new_t = st.text_input("新名称", key=f"hist_rename_text_{cid_it}")
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            if st.button("保存", key=f"hist_rename_save_{cid_it}"):
+                                res = rename_conversation(cid_it, new_t)
+                                if isinstance(res, dict) and res.get("ok"):
+                                    if cid_it == cid_now:
+                                        st.session_state["conversation_title"] = str(new_t or "").strip()
+                                    st.session_state["history_menu_cid"] = None
+                                    st.session_state.pop("history_rename_cid", None)
+                                    _rerun()
+                                else:
+                                    st.error(f"重命名失败：{res.get('error') if isinstance(res, dict) else res}")
+                        with b2:
+                            if st.button("取消", key=f"hist_rename_cancel_{cid_it}"):
+                                st.session_state.pop("history_rename_cid", None)
+                                _rerun()
+
+                    if str(st.session_state.get("history_delete_cid") or "") == cid_it:
+                        confirm = st.checkbox("确认删除该对话", key=f"hist_delete_confirm_{cid_it}")
+                        if st.button("确认删除", key=f"hist_delete_do_{cid_it}", disabled=not bool(confirm)):
+                            delete_conversation(cid_it)
+                            st.session_state["history_menu_cid"] = None
+                            st.session_state.pop("history_delete_cid", None)
+
+                            # 删除当前对话：自动新建一个空对话，避免 UI 处于无 cid 状态
+                            if cid_it == cid_now:
+                                _reset_workspace_state(cancel_running_job=True)
+                                st.session_state["conversation_id"] = new_conversation_id()
+                                st.session_state["conversation_title"] = ""
+                                st.session_state["history_loaded"] = True
+                                st.session_state["history_created_ts"] = time.time()
+                                _set_query_params(cid=st.session_state["conversation_id"])
+                            _rerun()
 
         st.divider()
         st.subheader("模型配置")
@@ -1882,8 +2915,9 @@ def main() -> None:
     chat_base_url = os.getenv("OPENAI_BASE_URL", None) if use_system_key else ((user_base_url or "").strip() or None)
 
     # Embedding 可单独配置（优先 UI > .env > 复用 Chat）
-    env_embed_key = (os.getenv("MUJICA_EMBEDDING_API_KEY") or "").strip() or None
-    env_embed_base = (os.getenv("MUJICA_EMBEDDING_BASE_URL") or "").strip() or None
+    # Demo 门禁：未通过 Access Code 时，不允许使用环境变量中的系统 Embedding Key/BaseURL
+    env_embed_key = ((os.getenv("MUJICA_EMBEDDING_API_KEY") or "").strip() or None) if use_system_key else None
+    env_embed_base = ((os.getenv("MUJICA_EMBEDDING_BASE_URL") or "").strip() or None) if use_system_key else None
     embedding_api_key = (embedding_api_key_input or "").strip() or env_embed_key or chat_api_key
     embedding_base_url = (embedding_base_url_input or "").strip() or env_embed_base or chat_base_url
 
@@ -1918,6 +2952,31 @@ def main() -> None:
             embedding_base_url=embedding_base_url,
             use_fake_embeddings=use_fake_embeddings,
         )
+
+    # 自动保存对话历史（仅当有实际内容时保存，避免空对话刷屏）
+    try:
+        if st.session_state.get("enable_chat_history") and st.session_state.get("conversation_id"):
+            snap = _history_snapshot()
+            # 只有当存在用户消息时才保存（避免刷新页面产生大量空对话）
+            has_content = False
+            msgs = snap.get("messages") or []
+            for m in msgs:
+                if isinstance(m, dict) and m.get("role") in {"user", "assistant"}:
+                    has_content = True
+                    break
+            # 也检查是否有报告/研究笔记等内容
+            if not has_content:
+                if snap.get("final_report") or snap.get("research_notes") or snap.get("pending_plan"):
+                    has_content = True
+            
+            if has_content:
+                s = json.dumps(snap, ensure_ascii=False, sort_keys=True)
+                h = str(hash(s))
+                if h != str(st.session_state.get("history_last_hash") or ""):
+                    save_conversation(str(st.session_state.get("conversation_id") or ""), snap)
+                    st.session_state["history_last_hash"] = h
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

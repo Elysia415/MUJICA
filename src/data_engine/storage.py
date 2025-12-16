@@ -689,7 +689,6 @@ class KnowledgeBase:
             print(
                 f"[Embedding] chunks done: ok={ok_total}/{total} empty={empty_total} elapsed={time.time()-t0:.1f}s"
             )
-
             if rows_to_insert:
                 if self.chunks_table in self.db.table_names():
                     self.db.open_table(self.chunks_table).add(rows_to_insert)
@@ -699,6 +698,27 @@ class KnowledgeBase:
         # 4) 刷新 metadata_df
         self.metadata_df = self._load_metadata_df()
         print(f"✓ Ingested {len(papers)} papers (metadata) into SQLite and vectors into LanceDB.")
+
+    def get_paper_ids_with_content(self) -> set[str]:
+        """
+        获取已存在全文索引(full_text)的 paper_id 集合。
+        用于断点续传（跳过已 Parsing/Embedding 的论文）。
+        """
+        if self.db is None:
+            return set()
+        if self.chunks_table not in self.db.table_names():
+            return set()
+        
+        try:
+            tbl = self.db.open_table(self.chunks_table)
+            # 仅查询 source='full_text' 的记录，只取 paper_id 列
+            # 注意：LanceDB 早期版本可能不支持 distinct 查询，这里先拉回所有符合条件的 id 再去重
+            # limit=None 表示拉取全量
+            res = tbl.search().where("source = 'full_text'").select(["paper_id"]).limit(None).to_list()
+            return set([r["paper_id"] for r in res if r.get("paper_id")])
+        except Exception as e:
+            print(f"Warning: failed to query existing content ids: {e}")
+            return set()
 
     def _upsert_paper_and_reviews(self, p: Dict[str, Any]) -> None:
         assert self._meta_conn is not None

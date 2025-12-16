@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from src.data_engine.storage import KnowledgeBase
+from src.utils.cancel import MujicaCancelled, check_cancel
 from src.utils.json_utils import extract_json_object
 
 
@@ -80,11 +81,18 @@ class ResearcherAgent:
 
         return out
 
-    def execute_research(self, plan: Dict[str, Any], *, on_progress: Optional[Any] = None) -> List[Dict[str, Any]]:
+    def execute_research(
+        self,
+        plan: Dict[str, Any],
+        *,
+        on_progress: Optional[Any] = None,
+        cancel_event: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         """
         执行研究：结构化过滤 + 语义检索（chunk）+ 生成可追溯研究笔记（含证据片段）。
         """
         t_all = time.time()
+        check_cancel(cancel_event, stage="research_start")
         print("[Research] starting research phase...")
         research_notes: List[Dict[str, Any]] = []
 
@@ -104,6 +112,7 @@ class ResearcherAgent:
             section_name = section.get("name") or "Section"
             query = section.get("search_query") or ""
             print(f"[Research] ({si+1}/{total_sections}) section={section_name} query={query!r}")
+            check_cancel(cancel_event, stage=f"research_section:{section_name}")
 
             if callable(on_progress):
                 try:
@@ -137,6 +146,7 @@ class ResearcherAgent:
             allowed_paper_ids: Optional[set[str]] = None
             allowed_papers_count: Optional[int] = None
             if isinstance(metadata_df, pd.DataFrame) and not metadata_df.empty and section_filters:
+                check_cancel(cancel_event, stage=f"structured_filter:{section_name}")
                 t_f = time.time()
                 filtered = self._apply_filters(metadata_df, section_filters)
                 allowed_paper_ids = set(filtered["id"].tolist())
@@ -150,6 +160,7 @@ class ResearcherAgent:
                 print("[Research] structured_filter: skipped (no filters or empty metadata)")
 
             # 2) chunk-level retrieval
+            check_cancel(cancel_event, stage=f"chunk_retrieval:{section_name}")
             t_r = time.time()
             chunk_hits = self.kb.search_chunks(query, limit=top_k_chunks)
             dt_r = time.time() - t_r
@@ -177,6 +188,7 @@ class ResearcherAgent:
             # 3) 选 Top-N papers，并为每篇 paper 取前若干 chunks 作为证据
             by_paper: Dict[str, List[Dict[str, Any]]] = {}
             for h in chunk_hits:
+                check_cancel(cancel_event, stage=f"group_hits:{section_name}")
                 pid = h.get("paper_id")
                 if not pid:
                     continue
@@ -215,6 +227,7 @@ class ResearcherAgent:
                 rebuttal_chunks_per_paper = 1
             rebuttal_chunks_per_paper = max(0, min(rebuttal_chunks_per_paper, 3))
             for pid, hits in paper_ranked:
+                check_cancel(cancel_event, stage=f"collect_evidence:{section_name}")
                 source_ids.append(pid)
                 # 3.1) 强制补充 meta chunk（用于引用作者/关键词/评分/决策/年份等元信息）
                 meta_chunk_id = f"{pid}::meta::0"
@@ -244,6 +257,7 @@ class ResearcherAgent:
                 # 3.1a) 决策说明 chunk（如果存在）
                 if decision_chunks_per_paper > 0:
                     for didx in range(decision_chunks_per_paper):
+                        check_cancel(cancel_event, stage=f"collect_decision:{section_name}")
                         decision_chunk_id = f"{pid}::decision::{didx}"
                         try:
                             dc = self.kb.get_chunk_by_id(decision_chunk_id)
@@ -268,6 +282,7 @@ class ResearcherAgent:
                 # 3.1b) 作者 rebuttal/response chunk（如果存在）
                 if rebuttal_chunks_per_paper > 0:
                     for ridx in range(rebuttal_chunks_per_paper):
+                        check_cancel(cancel_event, stage=f"collect_rebuttal:{section_name}")
                         rebuttal_chunk_id = f"{pid}::rebuttal::{ridx}"
                         try:
                             rc = self.kb.get_chunk_by_id(rebuttal_chunk_id)
@@ -297,6 +312,7 @@ class ResearcherAgent:
                         reviews_rows = []
                     if isinstance(reviews_rows, list) and reviews_rows:
                         for ridx in range(min(len(reviews_rows), review_chunks_per_paper)):
+                            check_cancel(cancel_event, stage=f"collect_reviews:{section_name}")
                             review_chunk_id = f"{pid}::review_{ridx}::0"
                             try:
                                 rc = self.kb.get_chunk_by_id(review_chunk_id)
@@ -321,6 +337,7 @@ class ResearcherAgent:
                 hits_sorted_all = sorted(hits, key=lambda x: x.get("_distance", 1e9))
                 content_hits = [h for h in hits_sorted_all if h.get("source") != "meta"][:chunks_per_paper]
                 for hh in content_hits:
+                    check_cancel(cancel_event, stage=f"collect_content:{section_name}")
                     evidence.append(
                         {
                             "paper_id": pid,
@@ -343,6 +360,7 @@ class ResearcherAgent:
             )
             evidence_text = ""
             for e in evidence:
+                check_cancel(cancel_event, stage=f"build_prompt:{section_name}")
                 evidence_text += (
                     f"\n[Paper ID: {e['paper_id']} | Chunk: {e['chunk_id']} | Source: {e['source']}]\n"
                     f"Title: {e['title']}\n"
@@ -376,6 +394,7 @@ Evidence Snippets（可引用 chunk_id 以便溯源）：
             key_points: List[Dict[str, Any]] = []
             try:
                 t_llm = time.time()
+                check_cancel(cancel_event, stage=f"llm_summarise_before:{section_name}")
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -399,11 +418,14 @@ Evidence Snippets（可引用 chunk_id 以便溯源）：
                         messages=messages,
                     )
                     parsed = extract_json_object(response.choices[0].message.content or "")
+                check_cancel(cancel_event, stage=f"llm_summarise_after:{section_name}")
                 summary_content = parsed.get("summary", "") or ""
                 key_points = parsed.get("key_points", []) or []
                 print(
                     f"[Research] summarise: dt={time.time()-t_llm:.2f}s summary_len={len(summary_content)} key_points={len(key_points)}"
                 )
+            except MujicaCancelled:
+                raise
             except Exception as e:
                 print(f"Error summarising: {e}")
                 summary_content = "研究笔记生成失败（LLM 调用/JSON 解析异常）。"

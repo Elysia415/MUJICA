@@ -21,6 +21,21 @@
     border-right: 1px solid var(--border);
 }
 
+/* Brand link (click to go home) */
+.mujica-brand-link {
+    display: inline-block;
+    font-size: 1.8rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text) !important;
+    text-decoration: none !important;
+    margin: 0.25rem 0 0.1rem 0;
+}
+
+.mujica-brand-link:hover {
+    opacity: 0.92;
+}
+
 /* Typography */
 h1,
 h2,
@@ -30,8 +45,7 @@ h5,
 h6 {
     color: var(--text) !important;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", Arial, sans-serif;
-    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
-    /* Make headers pop */
+    text-shadow: none !important;
 }
 
 /* 关键：Streamlit 的 widget label/正文有时会被内联样式覆盖，导致暗色看不清。
@@ -87,24 +101,29 @@ small {
 /* Buttons - Universal Reset & Base Styles */
 .stButton>button,
 .stFormSubmitButton>button {
-    border-radius: 6px;
-    font-weight: 600;
-    transition: all 0.2s ease;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    position: relative;
-    overflow: hidden;
-    /* Default to Primary var if specific selector fails (Safe fallback) */
-    background: var(--btn-primary-bg);
-    color: var(--btn-primary-text);
-    border: 1px solid var(--btn-primary-border);
-    box-shadow: 0 0 15px var(--accent-shadow);
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    transition: all 0.15s ease !important;
+    text-transform: uppercase !important;
+    letter-spacing: 1.5px !important;
+    position: relative !important;
+    overflow: hidden !important;
+    /* Force no gradient/image background - use solid color */
+    background-image: none !important;
+    background: var(--btn-primary-bg) !important;
+    background-color: var(--btn-primary-bg) !important;
+    color: var(--btn-primary-text) !important;
+    border: 1px solid var(--btn-primary-border) !important;
+    box-shadow: none !important;
 }
 
 /* Specific Target for Primary Buttons */
 .stButton>button[data-testid="baseButton-primary"],
-.stFormSubmitButton>button[data-testid="baseButton-primary"] {
+.stFormSubmitButton>button[data-testid="baseButton-primary"],
+div[data-testid="stForm"] button[data-testid="baseButton-primary"] {
+    background-image: none !important;
     background: var(--btn-primary-bg) !important;
+    background-color: var(--btn-primary-bg) !important;
     color: var(--btn-primary-text) !important;
     border: 1px solid var(--btn-primary-border) !important;
 }
@@ -112,28 +131,57 @@ small {
 /* Specific Target for Secondary Buttons */
 .stButton>button[data-testid="baseButton-secondary"],
 .stFormSubmitButton>button[data-testid="baseButton-secondary"] {
+    background-image: none !important;
     background: var(--btn-secondary-bg) !important;
+    background-color: var(--btn-secondary-bg) !important;
     color: var(--btn-secondary-text) !important;
     border: 1px solid var(--btn-secondary-border) !important;
     box-shadow: none !important;
-    /* Secondary usually has no glow by default */
 }
 
-/* Hover States */
+/* ============================================================
+   HOVER STATES - Theme Aware (Variables defined in ui/app.py)
+   ============================================================ */
+
+/* Universal Hover - All Buttons */
 .stButton>button:hover,
-.stFormSubmitButton>button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 0 25px var(--accent-shadow-hover), inset 0 0 10px rgba(255, 255, 255, 0.2);
+.stFormSubmitButton>button:hover,
+div[data-testid="stForm"] button:hover {
+    background-image: none !important;
+    background: var(--btn-hover-bg) !important;
+    background-color: var(--btn-hover-bg) !important;
+    filter: var(--btn-hover-filter) !important;
+    transform: var(--btn-hover-transform) !important;
+    box-shadow: var(--btn-hover-shadow) !important;
+    border-color: var(--btn-hover-border) !important;
+    color: var(--btn-hover-color) !important;
 }
 
-/* Specific Hover for Secondary */
+/* Primary Button Hover */
+.stButton>button[data-testid="baseButton-primary"]:hover,
+.stFormSubmitButton>button[data-testid="baseButton-primary"]:hover,
+div[data-testid="stForm"] button[data-testid="baseButton-primary"]:hover {
+    background-image: none !important;
+    background: var(--btn-hover-bg) !important;
+    background-color: var(--btn-hover-bg) !important;
+    filter: var(--btn-hover-filter) !important;
+    transform: var(--btn-hover-transform) !important;
+    border-color: var(--btn-hover-border) !important;
+    color: var(--btn-hover-color) !important;
+    box-shadow: var(--btn-hover-shadow) !important;
+}
+
+/* Secondary Button Hover */
 .stButton>button[data-testid="baseButton-secondary"]:hover,
 .stFormSubmitButton>button[data-testid="baseButton-secondary"]:hover {
-    border-color: var(--accent-2) !important;
-    /* Gold hover border for secondary */
-    color: var(--text) !important;
-    /* Optional: Slight fill on hover for glass buttons */
-    background: linear-gradient(145deg, rgba(138, 0, 43, 0.2) 0%, rgba(74, 0, 22, 0.2) 100%) !important;
+    background-image: none !important;
+    background: var(--btn-sec-hover-bg) !important;
+    background-color: var(--btn-sec-hover-bg) !important;
+    border-color: var(--btn-sec-hover-border) !important;
+    color: var(--btn-sec-hover-color) !important;
+    box-shadow: none !important;
+    filter: none !important;
+    transform: var(--btn-hover-transform) !important;
 }
 
 /* Inputs */
@@ -234,4 +282,26 @@ div[data-testid="stForm"] {
     border: 1px solid var(--border) !important;
     border-radius: 14px !important;
     box-shadow: var(--shadow);
+}
+
+/* Floating / sticky panel (Evidence & Verification) */
+.mujica-float-wrap {
+    position: sticky;
+    top: 1.0rem;
+    z-index: 50;
+}
+
+.mujica-float-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    padding: 0.8rem 0.9rem;
+    max-height: calc(100vh - 6.5rem);
+    overflow: auto;
+    backdrop-filter: blur(14px);
+}
+
+.mujica-float-card hr {
+    border-color: var(--border) !important;
 }

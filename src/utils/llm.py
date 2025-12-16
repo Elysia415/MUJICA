@@ -188,23 +188,37 @@ def _embeddings_create_with_retry(client: OpenAI, *, model: str, input_texts: Li
     # 理论上不会到这里
     raise last_err if last_err else RuntimeError("Embedding create failed")
 
-def get_llm_client(api_key: Optional[str] = None, base_url: Optional[str] = None):
+def get_llm_client(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    *,
+    allow_env_fallback: bool = True,
+):
     """
     Returns an initialized OpenAI client.
     Args:
         api_key: User-provided API key. If None, falls back to env var.
         base_url: User-provided Base URL. If None, falls back to env var.
+        allow_env_fallback: 是否允许从环境变量读取 OPENAI_API_KEY/OPENAI_BASE_URL。
+            - True（默认）：兼容脚本/本地直接用 .env 配置的方式
+            - False：严格模式，只使用显式传入的 api_key/base_url（用于 Demo 门禁）
     """
     load_env()
     # 1. Determine API Key
-    final_api_key = api_key if api_key else os.getenv("OPENAI_API_KEY")
+    if allow_env_fallback:
+        final_api_key = api_key if api_key else os.getenv("OPENAI_API_KEY")
+    else:
+        final_api_key = api_key if api_key else None
     
     if not final_api_key:
         print("Warning: API Key not found (neither provided nor in env).")
         return None
     
     # 2. Determine Base URL
-    final_base_url = base_url if base_url else os.getenv("OPENAI_BASE_URL")
+    if allow_env_fallback:
+        final_base_url = base_url if base_url else os.getenv("OPENAI_BASE_URL")
+    else:
+        final_base_url = base_url if base_url else None
     
     return OpenAI(api_key=final_api_key, base_url=final_base_url)
 
