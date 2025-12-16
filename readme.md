@@ -10,7 +10,7 @@ pinned: false
 license: mit
 ---
 
-# MUJICA · 论文调研报告生成器（循证可溯源）
+# MUJICA · 睦鉴：一个融合了用户评判与信息佐证的多阶段报告生成架构
 
 MUJICA（Multi-stage User‑Judged Integration & Corroboration Architecture）是一个面向 **OpenReview 会议论文** 的本地知识库 + 多阶段智能体系统：从抓取入库、语义检索、循证写作到逐句核查，全流程可追溯。
 
